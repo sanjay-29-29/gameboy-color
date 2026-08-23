@@ -1,13 +1,7 @@
-use std::mem;
-
-fn error(ins: u8) {
-    panic!("The program panicked at {ins}");
-}
-
 #[derive(Debug)]
 pub struct GameBoy {
     ram: [u8; 32 * 1024],
-    af: u16, // 0f bc
+    af: u16,
     bc: u16,
     de: u16,
     hl: u16,
@@ -50,138 +44,318 @@ impl GameBoy {
 
     pub fn main(&mut self) {
         loop {
-            let opcode = self.fetch_value();
+            let opcode = self.fetch_value_u8();
             let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
             match x {
-                0x00 => {
-                    if y == 0 && z == 0 {
-                        // NO-OP
+                0 => {
+                    if z == 0 {
+                        if y == 0 {
+                            // nop
+                        }
+                        if y == 2 {
+                            // stop
+                        }
+                        if y == 3 {
+                            // jr imm8
+                            let new_add = self.fetch_value_u8() as i8;
+                            self.pc = self.pc.wrapping_add(new_add as i16 as u16);
+                        }
+                        if y & 0b100 > 1 {
+                            // jr cond, imm8
+                            let offset = self.fetch_value_u8() as i8;
+
+                            if self.check_condition(y) {
+                                self.pc = self.pc.wrapping_add(offset as i16 as u16);
+                            }
+                        }
                     }
-                    if y == 0 && z == 7 {
-                        // RLCA
+                    if z == 1 && (y & 0b001) == 0 {
+                        // ld r16, imm16
+                        let val = self.fetch_value_u16();
+                        let register = self.get_r16(y);
+                        *register = val;
+                    }
+                    if z == 2 && (y & 0b001) == 0 {
+                        // ld [r16mem], a
+                        let a = self.get_register_a();
+                        let register = self.get_r16mem(y);
 
-                        let mut a = self.get_register_a();
-                        let last_bit = a >> 7;
+                        *register = a;
 
-                        self.set_zero_flag(false);
+                        self.post_ins_r16mem(y);
+                    }
+                    if z == 2 && (y & 0b001) == 1 {
+                        // ld a, [r16mem]
+                        let val = *self.get_r16mem(y);
+                        self.set_register_a(val);
+                        self.post_ins_r16mem(y);
+                    }
+                    if z == 0 && y == 1 {
+                        // ld [imm16], sp
+                        let addr = self.fetch_value_u16();
+                        let sp = self.sp;
+
+                        let mem = self.map_ram(addr);
+                        *mem = sp as u8;
+
+                        let mem = self.map_ram(addr.wrapping_add(1));
+                        *mem = (sp >> 8) as u8;
+                    }
+                    if z == 3 && (y & 0b001) == 0 {
+                        // inc r16
+                        let register = self.get_r16(y);
+                        let sum = (*register).wrapping_add(1);
+                        *register = sum;
+                    }
+                    if z == 3 && (y & 0b001) == 1 {
+                        // dec r16
+                        let register = self.get_r16(y);
+                        let sum = (*register).wrapping_sub(1);
+                        *register = sum;
+                    }
+                    if z == 1 && (y & 0b001) == 1 {
+                        // add hl, r16
+                        let register_val = *self.get_r16(y);
+                        let (sum, did_carry) = self.hl.overflowing_add(register_val);
+
                         self.set_subtraction_flag(false);
-                        self.set_half_overflow_flag(false);
-                        self.set_overflow_flag(last_bit == 1);
+                        self.set_half_overflow_flag(
+                            (register_val & 0x0FFF) + (self.hl & 0x0FFF) > 0x0FFF,
+                        );
+                        self.set_overflow_flag(did_carry);
 
-                        a <<= 1;
-                        self.set_register_a(a | last_bit);
+                        self.hl = sum;
                     }
-                    if y == 2 && z == 8 {
-                        // RLA
+                    if z == 4 {
+                        // inc r8
+                        let register = self.get_r8(y);
+                        let sum = register.wrapping_add(1);
+
+                        self.set_zero_flag(sum == 0);
+                        self.set_subtraction_flag(false);
+                        self.set_half_overflow_flag(register & 0x0F == 0x0F);
+
+                        self.set_r8(y, sum);
+                    }
+                    if z == 5 {
+                        // dec r8
+                        let register = self.get_r8(y);
+                        let diff = register.wrapping_sub(1);
+
+                        self.set_zero_flag(diff == 0);
+                        self.set_subtraction_flag(true);
+                        self.set_half_overflow_flag(register & 0x0F == 0);
+
+                        self.set_r8(y, diff);
+                    }
+                    if z == 6 {
+                        // ld r8, imm8
+                        let val = self.fetch_value_u8();
+                        self.set_r8(y, val);
+                    }
+                    if z == 7 {
+                        match y {
+                            0 => {
+                                // rlca
+                                let a = self.get_register_a();
+                                let last_bit = a >> 7;
+
+                                self.set_zero_flag(false);
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag(last_bit == 1);
+
+                                self.set_register_a(a.rotate_left(1));
+                            }
+                            1 => {
+                                // rrca
+                                let a = self.get_register_a();
+                                let first_bit = a & 1;
+
+                                self.set_zero_flag(false);
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag(first_bit == 1);
+
+                                self.set_register_a(a.rotate_right(1));
+                            }
+                            2 => {
+                                // rla
+                                let mut a = self.get_register_a();
+                                let carry = self.get_overflow_flag() as u8;
+
+                                self.set_zero_flag(false);
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag((a & 0x80) > 1);
+
+                                let res = (a << 1) | carry;
+
+                                self.set_register_a(res);
+                            }
+                            3 => {
+                                // rra
+                                let mut a = self.get_register_a();
+                                let carry = self.get_overflow_flag() as u8;
+
+                                self.set_zero_flag(false);
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag((a & 1) == 1);
+
+                                let res = (a >> 1) | (carry << 7);
+
+                                self.set_register_a(res);
+                            }
+                            4 => {
+                                // daa
+                            }
+                            5 => {
+                                // cpl
+                                self.set_register_a(!self.get_register_a());
+                                self.set_subtraction_flag(true);
+                                self.set_half_overflow_flag(true);
+                            }
+                            6 => {
+                                // scf
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag(true);
+                            }
+                            7 => {
+                                // ccf
+                                self.set_subtraction_flag(false);
+                                self.set_half_overflow_flag(false);
+                                self.set_overflow_flag(!self.get_overflow_flag());
+                            }
+                            _ => panic!("Invalid OP Code: {opcode}"),
+                        }
                     }
                 }
-                0x01 => {
+                1 => {
                     if y == 6 && z == 6 {
-                        // halt instruction
+                        // HALT
                     } else {
                         let val = self.get_r8(z);
                         self.set_r8(y, val);
                     }
                 }
-                0x10 => {
-                    let val = self.get_r8(z);
-                    let a = self.get_register_a();
-
-                    let res: u8 = match y {
-                        0 => {
-                            let (sum, did_overflow) = val.overflowing_add(a);
-
-                            self.set_subtraction_flag(false);
-                            self.set_half_overflow_flag((0x0F & val) + (0x0F & a) > 0x0F);
-                            self.set_overflow_flag(did_overflow);
-
-                            sum
-                        }
-                        1 => {
-                            let overflow = self.get_overflow_flag() as u8;
-                            let (sum, did_overflow) = val.overflowing_add(overflow + a);
-
-                            self.set_subtraction_flag(false);
-                            self.set_half_overflow_flag(
-                                (0x0F & val) + (0x0F & a) + overflow > 0x0F,
-                            );
-                            self.set_overflow_flag(did_overflow);
-
-                            sum
-                        }
-                        2 => {
-                            let a = self.get_register_a();
-                            let (diff, did_carry) = val.overflowing_sub(a);
-
-                            self.set_subtraction_flag(true);
-                            self.set_half_overflow_flag((a & 0x0F) > (0x0F & val));
-                            self.set_overflow_flag(did_carry);
-
-                            diff
-                        }
-                        3 => {
-                            let a = self.get_register_a();
-                            let (diff, did_carry) =
-                                a.overflowing_sub(val + self.get_overflow_flag() as u8);
-
-                            self.set_subtraction_flag(true);
-                            self.set_half_overflow_flag((a & 0x0F) > (0x0F & val) + val);
-                            self.set_overflow_flag(did_carry);
-
-                            diff
-                        }
-                        4 => {
-                            let and = val & a;
-
-                            self.set_subtraction_flag(false);
-                            self.set_half_overflow_flag(true);
-                            self.set_overflow_flag(false);
-
-                            and
-                        }
-                        5 => {
-                            let xor = val ^ a;
-
-                            self.set_subtraction_flag(false);
-                            self.set_half_overflow_flag(false);
-                            self.set_overflow_flag(false);
-
-                            xor
-                        }
-                        6 => {
-                            let or = val | a;
-
-                            self.set_subtraction_flag(false);
-                            self.set_half_overflow_flag(false);
-                            self.set_overflow_flag(false);
-
-                            or
-                        }
-                        7 => {
-                            let (diff, did_carry) = a.overflowing_sub(val);
-
-                            self.set_zero_flag(diff == 0);
-                            self.set_subtraction_flag(true);
-                            self.set_half_overflow_flag((0x0F & a) < (0x0F & val));
-                            self.set_overflow_flag(did_carry);
-
-                            continue; // CP X instruction does not update the register A
-                        }
-                        _ => panic!("Invalid operation {y}"),
-                    };
-
-                    self.set_register_a(res);
-                    self.set_zero_flag(res == 0);
+                2 => {
+                    self.handle_alu_op(y, z);
                 }
-                0x11 => {}
+                3 => {}
                 _ => {}
             }
         }
     }
 
-    fn get_r16(&mut self, instruction: u8) -> &mut u16 {
-        let res = match instruction >> 4 {
+    fn check_condition(&self, y: u8) -> bool {
+        let res = match y & !0b100 {
+            0 => !self.get_zero_flag(),
+            1 => self.get_zero_flag(),
+            2 => !self.get_overflow_flag(),
+            3 => self.get_overflow_flag(),
+            _ => panic!("Not a valid condition {y}"),
+        };
+
+        res
+    }
+
+    fn handle_alu_op(&mut self, y: u8, z: u8) {
+        let val = self.get_r8(z);
+        let a = self.get_register_a();
+
+        let res: u8 = match y {
+            0 => {
+                let (sum, did_overflow) = val.overflowing_add(a);
+
+                self.set_subtraction_flag(false);
+                self.set_half_overflow_flag((0x0F & val) + (0x0F & a) > 0x0F);
+                self.set_overflow_flag(did_overflow);
+
+                sum
+            }
+            1 => {
+                let overflow = self.get_overflow_flag() as u8;
+
+                let (sum1, carry1) = val.overflowing_add(a);
+                let (sum, carry2) = sum1.overflowing_add(overflow);
+
+                self.set_subtraction_flag(false);
+                self.set_half_overflow_flag((0x0F & val) + (0x0F & a) + overflow > 0x0F);
+                self.set_overflow_flag(carry1 || carry2);
+
+                sum
+            }
+            2 => {
+                let a = self.get_register_a();
+                let (diff, did_carry) = a.overflowing_sub(val);
+
+                self.set_subtraction_flag(true);
+                self.set_half_overflow_flag((a & 0x0F) < (0x0F & val));
+                self.set_overflow_flag(did_carry);
+
+                diff
+            }
+            3 => {
+                let overflow = self.get_overflow_flag() as u8;
+
+                let (diff1, borrow1) = a.overflowing_sub(val);
+                let (diff, borrow2) = diff1.overflowing_sub(overflow);
+
+                self.set_subtraction_flag(true);
+                self.set_half_overflow_flag((a & 0x0F) < (0x0F & val) + overflow);
+                self.set_overflow_flag(borrow1 || borrow2);
+
+                diff
+            }
+            4 => {
+                let and = val & a;
+
+                self.set_subtraction_flag(false);
+                self.set_half_overflow_flag(true);
+                self.set_overflow_flag(false);
+
+                and
+            }
+            5 => {
+                let xor = val ^ a;
+
+                self.set_subtraction_flag(false);
+                self.set_half_overflow_flag(false);
+                self.set_overflow_flag(false);
+
+                xor
+            }
+            6 => {
+                let or = val | a;
+
+                self.set_subtraction_flag(false);
+                self.set_half_overflow_flag(false);
+                self.set_overflow_flag(false);
+
+                or
+            }
+            7 => {
+                let (diff, did_carry) = a.overflowing_sub(val);
+
+                self.set_zero_flag(diff == 0);
+                self.set_subtraction_flag(true);
+                self.set_half_overflow_flag((0x0F & a) < (0x0F & val));
+                self.set_overflow_flag(did_carry);
+
+                return; // CP X instruction does not update the register A
+            }
+            _ => panic!("Invalid operation {y}"),
+        };
+
+        self.set_register_a(res);
+        self.set_zero_flag(res == 0);
+    }
+
+    fn get_r16(&mut self, y: u8) -> &mut u16 {
+        let res = match y >> 1 {
             0x0 => &mut self.bc,
             0x1 => &mut self.de,
             0x2 => &mut self.hl,
@@ -192,24 +366,24 @@ impl GameBoy {
         res
     }
 
-    fn get_r16mem(&mut self, instruction: u8) -> &mut u16 {
-        let res = match instruction >> 4 {
-            0x0 => &mut self.bc,
-            0x1 => &mut self.de,
-            0x2 => &mut self.hl,
-            0x3 => &mut self.hl,
+    fn get_r16mem(&mut self, y: u8) -> &mut u8 {
+        let res = match y >> 1 {
+            0x0 => self.map_ram(self.bc),
+            0x1 => self.map_ram(self.de),
+            0x2 => self.map_ram(self.hl),
+            0x3 => self.map_ram(self.hl),
             _ => panic!("Not supported"),
         };
 
         res
     }
 
-    fn post_ins_r16mem(&mut self, instruction: u8) {
-        match instruction >> 4 {
+    fn post_ins_r16mem(&mut self, y: u8) {
+        match y >> 1 {
             0x0 => {}
             0x1 => {}
-            0x2 => self.hl += 1,
-            0x3 => self.hl += 1,
+            0x2 => self.hl = self.hl.wrapping_add(1),
+            0x3 => self.hl = self.hl.wrapping_sub(1),
             _ => panic!("Not supported"),
         };
     }
@@ -247,42 +421,46 @@ impl GameBoy {
         };
     }
 
-    fn fetch_value(&mut self) -> u8 {
+    fn fetch_value_u8(&mut self) -> u8 {
         let val = *self.map_ram(self.pc);
         self.pc = self.pc.wrapping_add(1);
 
         return val;
     }
 
-    fn decrement_register(&mut self, reg: u8) -> u8 {
-        let res = reg.wrapping_sub(1);
-
-        self.set_zero_flag(res == 0);
-        self.set_subtraction_flag(true);
-        self.set_half_overflow_flag((0x0F & reg) == 0);
-
-        res
+    fn fetch_value_u16(&mut self) -> u16 {
+        return self.fetch_value_u8() as u16 | (self.fetch_value_u8() as u16) << 8;
     }
 
-    fn increment_register(&mut self, reg: u8) -> u8 {
-        let res = reg.wrapping_add(1);
+    // fn decrement_register(&mut self, reg: u8) -> u8 {
+    //     let res = reg.wrapping_sub(1);
 
-        self.set_zero_flag(res == 0);
-        self.set_subtraction_flag(false);
-        self.set_half_overflow_flag(reg & 0x0F == 0x0F);
+    //     self.set_zero_flag(res == 0);
+    //     self.set_subtraction_flag(true);
+    //     self.set_half_overflow_flag((0x0F & reg) == 0);
 
-        res
-    }
+    //     res
+    // }
 
-    fn u16_wrapping_add(&mut self, val1: u16, val2: u16) -> u16 {
-        let (sum, did_overflow) = val1.overflowing_add(val2);
+    // fn increment_register(&mut self, reg: u8) -> u8 {
+    //     let res = reg.wrapping_add(1);
 
-        self.set_subtraction_flag(false);
-        self.set_half_overflow_flag((val1 & 0x0FFF) + (val2 & 0x0FFF) > 0xFFF);
-        self.set_overflow_flag(did_overflow);
+    //     self.set_zero_flag(res == 0);
+    //     self.set_subtraction_flag(false);
+    //     self.set_half_overflow_flag(reg & 0x0F == 0x0F);
 
-        return sum;
-    }
+    //     res
+    // }
+
+    // fn u16_wrapping_add(&mut self, val1: u16, val2: u16) -> u16 {
+    //     let (sum, did_overflow) = val1.overflowing_add(val2);
+
+    //     self.set_subtraction_flag(false);
+    //     self.set_half_overflow_flag((val1 & 0x0FFF) + (val2 & 0x0FFF) > 0xFFF);
+    //     self.set_overflow_flag(did_overflow);
+
+    //     return sum;
+    // }
 
     fn set_register_a(&mut self, value: u8) {
         self.af = (self.af & 0x00FF) | (value as u16) << 8;
