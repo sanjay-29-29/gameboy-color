@@ -1,13 +1,20 @@
 #[derive(Debug)]
 pub struct GameBoy {
     ram: [u8; 32 * 1024],
+
+    // GP registers
     af: u16,
     bc: u16,
     de: u16,
     hl: u16,
 
+    // Stack Pointer
     sp: u16,
+    // Program Counter
     pc: u16,
+
+    // Interrupt Enable Flag
+    ie: bool,
 }
 
 impl GameBoy {
@@ -20,6 +27,7 @@ impl GameBoy {
             hl: 0,
             sp: 0,
             pc: 0,
+            ie: true,
         }
     }
 
@@ -182,7 +190,7 @@ impl GameBoy {
                             }
                             2 => {
                                 // rla
-                                let mut a = self.get_register_a();
+                                let a = self.get_register_a();
                                 let carry = self.get_overflow_flag() as u8;
 
                                 self.set_zero_flag(false);
@@ -196,7 +204,7 @@ impl GameBoy {
                             }
                             3 => {
                                 // rra
-                                let mut a = self.get_register_a();
+                                let a = self.get_register_a();
                                 let carry = self.get_overflow_flag() as u8;
 
                                 self.set_zero_flag(false);
@@ -242,9 +250,138 @@ impl GameBoy {
                     }
                 }
                 2 => {
-                    self.handle_alu_op(y, z);
+                    let val = self.get_r8(z);
+                    self.handle_alu_op(y, val);
                 }
-                3 => {}
+                3 => {
+                    if z == 6 {
+                        // alu ops
+                        let val = self.fetch_value_u8();
+                        self.handle_alu_op(y, val);
+                    }
+                    if z == 0 && (y & 0b100) == 0 {
+                        // ret cond
+                        if self.check_condition(y) {
+                            self.pc = self.pop_from_stack();
+                        }
+                    }
+                    if z == 1 && y == 1 {
+                        // ret
+                        self.pc = self.pop_from_stack();
+                    }
+                    if z == 1 && y == 3 {
+                        // reti
+                        self.ie = true;
+                        self.pc = self.pop_from_stack();
+                    }
+                    if z == 2 && (y & 0b100) == 0 {
+                        // jp cond, imm16
+                        let addr = self.fetch_value_u16();
+
+                        if self.check_condition(y) {
+                            self.pc = addr;
+                        }
+                    }
+                    if z == 3 && y == 0 {
+                        // jp imm16
+                        self.pc = self.fetch_value_u16();
+                    }
+                    if z == 1 && y == 5 {
+                        // jp hl
+                        self.pc = self.hl;
+                    }
+                    if z == 4 && (y & 0b100) == 0 {
+                        // call cond, imm16
+                        let val = self.fetch_value_u16();
+
+                        if self.check_condition(y) {
+                            self.push_to_stack(self.pc);
+                            self.pc = val;
+                        }
+                    }
+                    if z == 5 && y == 1 {
+                        // call imm16
+                        let val = self.fetch_value_u16();
+                        self.push_to_stack(self.pc);
+                        self.pc = val;
+                    }
+                    if z == 7 {
+                        // rst tgt3
+                    }
+                    if z == 1 && (y & 0b001) == 0 {
+                        // pop r16stk
+                        let val = self.pop_from_stack();
+
+                        if y == 6 {
+                            // force the bottom 4 bits to 0
+                            self.af = val & 0xFFF0;
+                        } else {
+                            let register = self.get_r16stk(y);
+                            *register = val;
+                        }
+                    }
+                    if z == 5 && (y & 0b001) == 0 {
+                        // push r16stk
+                        let register = *self.get_r16stk(y);
+                        self.push_to_stack(register);
+                    }
+                    if z == 2 && y == 4 {
+                        // ldh [c], a
+                    }
+                    if z == 0 && y == 4 {
+                        // ldh [imm8], a
+                    }
+                    if z == 2 && y == 5 {
+                        // ld [imm16], a
+                    }
+                    if z == 2 && y == 6 {
+                        // ldh a, [c]
+                    }
+                    if z == 0 && y == 6 {
+                        // ldh a, [imm8]
+                    }
+                    if z == 2 && y == 7 {
+                        // ld a, [imm16]
+                    }
+                    if z == 0 && y == 5 {
+                        // add sp, imm8
+                        let val = self.fetch_value_u8();
+                        let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
+
+                        self.set_zero_flag(false);
+                        self.set_subtraction_flag(false);
+                        self.set_half_overflow_flag(
+                            (0x0F & self.sp) + (0x0F & (val as u16)) > 0x0F,
+                        );
+                        self.set_overflow_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+
+                        self.sp = sum;
+                    }
+                    if z == 0 && y == 7 {
+                        // ld hl, sp + imm8
+                        let val = self.fetch_value_u8();
+                        let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
+
+                        self.set_zero_flag(false);
+                        self.set_subtraction_flag(false);
+                        self.set_half_overflow_flag((self.sp & 0x0F) + (val as u16 & 0x0F) > 0x0F);
+                        self.set_overflow_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+
+                        self.hl = sum;
+                    }
+                    if z == 1 && y == 7 {
+                        // ld sp, hl
+                        self.sp = self.hl;
+                    }
+                    if z == 3 && y == 6 {
+                        // di
+                        self.ie = false;
+                    }
+                    if z == 3 && y == 7 {
+                        // ei
+                        self.ie = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -262,12 +399,12 @@ impl GameBoy {
         res
     }
 
-    fn handle_alu_op(&mut self, y: u8, z: u8) {
-        let val = self.get_r8(z);
+    fn handle_alu_op(&mut self, y: u8, val: u8) {
         let a = self.get_register_a();
 
         let res: u8 = match y {
             0 => {
+                // add a, r8
                 let (sum, did_overflow) = val.overflowing_add(a);
 
                 self.set_subtraction_flag(false);
@@ -277,6 +414,7 @@ impl GameBoy {
                 sum
             }
             1 => {
+                // adc a, r8
                 let overflow = self.get_overflow_flag() as u8;
 
                 let (sum1, carry1) = val.overflowing_add(a);
@@ -289,6 +427,7 @@ impl GameBoy {
                 sum
             }
             2 => {
+                // sub a, r8
                 let a = self.get_register_a();
                 let (diff, did_carry) = a.overflowing_sub(val);
 
@@ -299,6 +438,7 @@ impl GameBoy {
                 diff
             }
             3 => {
+                // sbc a, r8
                 let overflow = self.get_overflow_flag() as u8;
 
                 let (diff1, borrow1) = a.overflowing_sub(val);
@@ -311,6 +451,7 @@ impl GameBoy {
                 diff
             }
             4 => {
+                // and a, r8
                 let and = val & a;
 
                 self.set_subtraction_flag(false);
@@ -320,6 +461,7 @@ impl GameBoy {
                 and
             }
             5 => {
+                // xor a, r8
                 let xor = val ^ a;
 
                 self.set_subtraction_flag(false);
@@ -329,6 +471,7 @@ impl GameBoy {
                 xor
             }
             6 => {
+                // or a, r8
                 let or = val | a;
 
                 self.set_subtraction_flag(false);
@@ -338,6 +481,7 @@ impl GameBoy {
                 or
             }
             7 => {
+                // cp a, r8
                 let (diff, did_carry) = a.overflowing_sub(val);
 
                 self.set_zero_flag(diff == 0);
@@ -345,9 +489,9 @@ impl GameBoy {
                 self.set_half_overflow_flag((0x0F & a) < (0x0F & val));
                 self.set_overflow_flag(did_carry);
 
-                return; // CP X instruction does not update the register A
+                return; // instruction does not update the register A
             }
-            _ => panic!("Invalid operation {y}"),
+            _ => panic!("Invalid ALU operation {y}"),
         };
 
         self.set_register_a(res);
@@ -360,6 +504,18 @@ impl GameBoy {
             0x1 => &mut self.de,
             0x2 => &mut self.hl,
             0x3 => &mut self.sp,
+            _ => panic!("Not supported"),
+        };
+
+        res
+    }
+
+    fn get_r16stk(&mut self, y: u8) -> &mut u16 {
+        let res = match y >> 1 {
+            0x0 => &mut self.bc,
+            0x1 => &mut self.de,
+            0x2 => &mut self.hl,
+            0x3 => &mut self.af,
             _ => panic!("Not supported"),
         };
 
@@ -417,7 +573,7 @@ impl GameBoy {
                 *mem = val;
             }
             7 => self.set_register_a(val),
-            _ => panic!("Trying to get r8 with {register}"),
+            _ => panic!("Trying to set r8 with {register}"),
         };
     }
 
@@ -432,35 +588,25 @@ impl GameBoy {
         return self.fetch_value_u8() as u16 | (self.fetch_value_u8() as u16) << 8;
     }
 
-    // fn decrement_register(&mut self, reg: u8) -> u8 {
-    //     let res = reg.wrapping_sub(1);
+    fn pop_from_stack(&mut self) -> u16 {
+        let mut val = *self.map_ram(self.pc) as u16;
+        self.sp = self.sp.wrapping_add(1);
 
-    //     self.set_zero_flag(res == 0);
-    //     self.set_subtraction_flag(true);
-    //     self.set_half_overflow_flag((0x0F & reg) == 0);
+        val |= (*self.map_ram(self.pc) as u16) << 8;
+        self.sp = self.sp.wrapping_add(1);
 
-    //     res
-    // }
+        return val;
+    }
 
-    // fn increment_register(&mut self, reg: u8) -> u8 {
-    //     let res = reg.wrapping_add(1);
+    fn push_to_stack(&mut self, val: u16) {
+        self.sp = self.sp.wrapping_sub(1);
+        let mem = self.map_ram(self.sp);
+        *mem = (val >> 8) as u8;
 
-    //     self.set_zero_flag(res == 0);
-    //     self.set_subtraction_flag(false);
-    //     self.set_half_overflow_flag(reg & 0x0F == 0x0F);
-
-    //     res
-    // }
-
-    // fn u16_wrapping_add(&mut self, val1: u16, val2: u16) -> u16 {
-    //     let (sum, did_overflow) = val1.overflowing_add(val2);
-
-    //     self.set_subtraction_flag(false);
-    //     self.set_half_overflow_flag((val1 & 0x0FFF) + (val2 & 0x0FFF) > 0xFFF);
-    //     self.set_overflow_flag(did_overflow);
-
-    //     return sum;
-    // }
+        self.sp = self.sp.wrapping_sub(1);
+        let mem = self.map_ram(self.sp);
+        *mem = val as u8;
+    }
 
     fn set_register_a(&mut self, value: u8) {
         self.af = (self.af & 0x00FF) | (value as u16) << 8;
@@ -516,10 +662,6 @@ impl GameBoy {
 
     fn get_register_h(&self) -> u8 {
         (self.hl >> 8) as u8
-    }
-
-    fn get_c(&self) -> u8 {
-        self.bc as u8
     }
 
     fn set_zero_flag(&mut self, value: bool) {
