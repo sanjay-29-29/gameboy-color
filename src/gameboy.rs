@@ -1,6 +1,7 @@
 #[derive(Debug)]
 pub struct GameBoy {
     ram: [u8; 32 * 1024],
+    vram: [u8; 16 * 1024],
 
     // GP registers
     af: u16,
@@ -21,6 +22,7 @@ impl GameBoy {
     pub fn new() -> Self {
         GameBoy {
             ram: [0; 32 * 1024],
+            vram: [0; 16 * 1024],
             af: 0,
             bc: 0,
             de: 0,
@@ -55,6 +57,12 @@ impl GameBoy {
             let opcode = self.fetch_value_u8();
             let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
+            if self.ram[0xff02] == 0x81 {
+                let c = self.ram[0xff01];
+                println!("{}", c as char);
+                self.ram[0xff02] = 0x0;
+            }
+
             match x {
                 0 => {
                     if z == 0 {
@@ -62,7 +70,7 @@ impl GameBoy {
                             // nop
                         }
                         if y == 2 {
-                            // stop
+                            // TODO: stop
                         }
                         if y == 3 {
                             // jr imm8
@@ -128,10 +136,10 @@ impl GameBoy {
                         let (sum, did_carry) = self.hl.overflowing_add(register_val);
 
                         self.set_subtraction_flag(false);
-                        self.set_half_overflow_flag(
+                        self.set_half_carry_flag(
                             (register_val & 0x0FFF) + (self.hl & 0x0FFF) > 0x0FFF,
                         );
-                        self.set_overflow_flag(did_carry);
+                        self.set_carry_flag(did_carry);
 
                         self.hl = sum;
                     }
@@ -142,7 +150,7 @@ impl GameBoy {
 
                         self.set_zero_flag(sum == 0);
                         self.set_subtraction_flag(false);
-                        self.set_half_overflow_flag(register & 0x0F == 0x0F);
+                        self.set_half_carry_flag(register & 0x0F == 0x0F);
 
                         self.set_r8(y, sum);
                     }
@@ -153,7 +161,7 @@ impl GameBoy {
 
                         self.set_zero_flag(diff == 0);
                         self.set_subtraction_flag(true);
-                        self.set_half_overflow_flag(register & 0x0F == 0);
+                        self.set_half_carry_flag(register & 0x0F == 0);
 
                         self.set_r8(y, diff);
                     }
@@ -171,8 +179,8 @@ impl GameBoy {
 
                                 self.set_zero_flag(false);
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag(last_bit == 1);
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag(last_bit == 1);
 
                                 self.set_register_a(a.rotate_left(1));
                             }
@@ -183,20 +191,20 @@ impl GameBoy {
 
                                 self.set_zero_flag(false);
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag(first_bit == 1);
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag(first_bit == 1);
 
                                 self.set_register_a(a.rotate_right(1));
                             }
                             2 => {
                                 // rla
                                 let a = self.get_register_a();
-                                let carry = self.get_overflow_flag() as u8;
+                                let carry = self.get_carry_flag() as u8;
 
                                 self.set_zero_flag(false);
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag((a & 0x80) > 1);
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag((a & 0x80) > 1);
 
                                 let res = (a << 1) | carry;
 
@@ -205,12 +213,12 @@ impl GameBoy {
                             3 => {
                                 // rra
                                 let a = self.get_register_a();
-                                let carry = self.get_overflow_flag() as u8;
+                                let carry = self.get_carry_flag() as u8;
 
                                 self.set_zero_flag(false);
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag((a & 1) == 1);
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag((a & 1) == 1);
 
                                 let res = (a >> 1) | (carry << 7);
 
@@ -218,24 +226,47 @@ impl GameBoy {
                             }
                             4 => {
                                 // daa
+                                let mut a = self.get_register_a();
+
+                                if self.get_subraction_flag() {
+                                    if self.get_half_carry_flag() {
+                                        a = a.wrapping_sub(0x06);
+                                    }
+                                    if self.get_carry_flag() {
+                                        a = a.wrapping_sub(0x60);
+                                    }
+                                } else {
+                                    if self.get_half_carry_flag() || (a & 0x0F) > 0x09 {
+                                        a = a.wrapping_add(0x06);
+                                    }
+                                    if self.get_carry_flag() || a > 0x99 {
+                                        a = a.wrapping_add(0x60);
+                                        self.set_carry_flag(true);
+                                    }
+                                }
+
+                                self.set_zero_flag(a == 0);
+                                self.set_half_carry_flag(false);
+
+                                self.set_register_a(a);
                             }
                             5 => {
                                 // cpl
                                 self.set_register_a(!self.get_register_a());
                                 self.set_subtraction_flag(true);
-                                self.set_half_overflow_flag(true);
+                                self.set_half_carry_flag(true);
                             }
                             6 => {
                                 // scf
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag(true);
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag(true);
                             }
                             7 => {
                                 // ccf
                                 self.set_subtraction_flag(false);
-                                self.set_half_overflow_flag(false);
-                                self.set_overflow_flag(!self.get_overflow_flag());
+                                self.set_half_carry_flag(false);
+                                self.set_carry_flag(!self.get_carry_flag());
                             }
                             _ => panic!("Invalid OP Code: {opcode}"),
                         }
@@ -243,7 +274,7 @@ impl GameBoy {
                 }
                 1 => {
                     if y == 6 && z == 6 {
-                        // HALT
+                        // TODO: halt
                     } else {
                         let val = self.get_r8(z);
                         self.set_r8(y, val);
@@ -307,6 +338,8 @@ impl GameBoy {
                     }
                     if z == 7 {
                         // rst tgt3
+                        self.push_to_stack(self.pc);
+                        self.pc = 0x0000 + (8 * y as u16); // JMP to offset + (y * 8)
                     }
                     if z == 1 && (y & 0b001) == 0 {
                         // pop r16stk
@@ -325,23 +358,55 @@ impl GameBoy {
                         let register = *self.get_r16stk(y);
                         self.push_to_stack(register);
                     }
+                    if z == 3 && y == 1 {
+                        // $CB prefix instructions
+                        let ins = self.fetch_value_u8();
+                        self.handle_prefix_cb_instruction(ins);
+                    }
                     if z == 2 && y == 4 {
                         // ldh [c], a
+                        let c = self.get_register_c();
+                        let a = self.get_register_a();
+                        let mem = self.map_ram((0xFF00_u16).wrapping_add(c as u16));
+
+                        *mem = a;
                     }
                     if z == 0 && y == 4 {
                         // ldh [imm8], a
+                        let val = self.fetch_value_u8() as u16;
+                        let a = self.get_register_a();
+                        let mem = self.map_ram((0xFF00_u16).wrapping_add(val));
+
+                        *mem = a;
                     }
                     if z == 2 && y == 5 {
                         // ld [imm16], a
+                        let a = self.get_register_a();
+                        let addr = self.fetch_value_u16();
+                        let mem = self.map_ram(addr);
+
+                        *mem = a;
                     }
                     if z == 2 && y == 6 {
                         // ldh a, [c]
+                        let c = self.get_register_c();
+                        let val = *self.map_ram((0xFF00_u16).wrapping_add(c as u16));
+
+                        self.set_register_a(val);
                     }
                     if z == 0 && y == 6 {
                         // ldh a, [imm8]
+                        let addr = self.fetch_value_u8() as u16;
+                        let val = *self.map_ram((0xFF00_u16).wrapping_add(addr));
+
+                        self.set_register_a(val);
                     }
                     if z == 2 && y == 7 {
                         // ld a, [imm16]
+                        let addr = self.fetch_value_u16();
+                        let val = *self.map_ram(addr);
+
+                        self.set_register_a(val);
                     }
                     if z == 0 && y == 5 {
                         // add sp, imm8
@@ -350,10 +415,8 @@ impl GameBoy {
 
                         self.set_zero_flag(false);
                         self.set_subtraction_flag(false);
-                        self.set_half_overflow_flag(
-                            (0x0F & self.sp) + (0x0F & (val as u16)) > 0x0F,
-                        );
-                        self.set_overflow_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+                        self.set_half_carry_flag((0x0F & self.sp) + (0x0F & (val as u16)) > 0x0F);
+                        self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
 
                         self.sp = sum;
                     }
@@ -364,8 +427,8 @@ impl GameBoy {
 
                         self.set_zero_flag(false);
                         self.set_subtraction_flag(false);
-                        self.set_half_overflow_flag((self.sp & 0x0F) + (val as u16 & 0x0F) > 0x0F);
-                        self.set_overflow_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+                        self.set_half_carry_flag((self.sp & 0x0F) + (val as u16 & 0x0F) > 0x0F);
+                        self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
 
                         self.hl = sum;
                     }
@@ -391,12 +454,127 @@ impl GameBoy {
         let res = match y & !0b100 {
             0 => !self.get_zero_flag(),
             1 => self.get_zero_flag(),
-            2 => !self.get_overflow_flag(),
-            3 => self.get_overflow_flag(),
+            2 => !self.get_carry_flag(),
+            3 => self.get_carry_flag(),
             _ => panic!("Not a valid condition {y}"),
         };
 
         res
+    }
+
+    fn handle_prefix_cb_instruction(&mut self, opcode: u8) {
+        let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
+        let register = self.get_r8(z);
+
+        match x {
+            0 => {
+                let res: u8 = match y {
+                    0 => {
+                        // rlc r8
+                        let last_bit = register >> 7;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(last_bit == 1);
+
+                        register.rotate_left(1)
+                    }
+                    1 => {
+                        // rrc r8
+                        let first_bit = register & 1;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(first_bit == 1);
+
+                        register.rotate_right(1)
+                    }
+                    2 => {
+                        // rl r8
+                        let carry = self.get_carry_flag() as u8;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag((register & 0x80) > 1);
+
+                        (register << 1) | carry
+                    }
+                    3 => {
+                        // rr r8
+                        let carry = self.get_carry_flag() as u8;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag((register & 1) == 1);
+
+                        (register >> 1) | (carry << 7)
+                    }
+                    4 => {
+                        // sla r8
+                        let last_bit = register >> 7;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(last_bit == 1);
+
+                        register << 1
+                    }
+                    5 => {
+                        // sra r8
+                        let first_bit = register & 1;
+                        let last_bit = register & 0x80;
+
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(first_bit == 1);
+
+                        (register >> 1) | last_bit
+                    }
+                    6 => {
+                        // swap r8
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+
+                        let lower_bits = 0x0F & register;
+                        let upper_bits = 0xF0 & register;
+
+                        lower_bits << 4 | upper_bits >> 4
+                    }
+                    7 => {
+                        // srl r8
+                        self.set_subtraction_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(register & 1 == 0);
+
+                        register >> 1
+                    }
+                    _ => {
+                        panic!("Invalid op with prefix $CB {opcode}");
+                    }
+                };
+
+                self.set_zero_flag(res == 0);
+                self.set_r8(z, res);
+            }
+            1 => {
+                // bit b3, r8
+                let register = self.get_r8(z);
+
+                self.set_zero_flag(!((register >> y) & 1 == 1));
+                self.set_subtraction_flag(false);
+                self.set_half_carry_flag(true);
+            }
+            2 => {
+                // res b3, r8
+                self.set_r8(z, register & !(1 << y));
+            }
+            3 => {
+                // set b3, r8
+                self.set_r8(z, register | (1 << y));
+            }
+            _ => panic!("Invalid OP code {opcode}"),
+        }
     }
 
     fn handle_alu_op(&mut self, y: u8, val: u8) {
@@ -408,21 +586,21 @@ impl GameBoy {
                 let (sum, did_overflow) = val.overflowing_add(a);
 
                 self.set_subtraction_flag(false);
-                self.set_half_overflow_flag((0x0F & val) + (0x0F & a) > 0x0F);
-                self.set_overflow_flag(did_overflow);
+                self.set_half_carry_flag((0x0F & val) + (0x0F & a) > 0x0F);
+                self.set_carry_flag(did_overflow);
 
                 sum
             }
             1 => {
                 // adc a, r8
-                let overflow = self.get_overflow_flag() as u8;
+                let overflow = self.get_carry_flag() as u8;
 
                 let (sum1, carry1) = val.overflowing_add(a);
                 let (sum, carry2) = sum1.overflowing_add(overflow);
 
                 self.set_subtraction_flag(false);
-                self.set_half_overflow_flag((0x0F & val) + (0x0F & a) + overflow > 0x0F);
-                self.set_overflow_flag(carry1 || carry2);
+                self.set_half_carry_flag((0x0F & val) + (0x0F & a) + overflow > 0x0F);
+                self.set_carry_flag(carry1 || carry2);
 
                 sum
             }
@@ -432,21 +610,21 @@ impl GameBoy {
                 let (diff, did_carry) = a.overflowing_sub(val);
 
                 self.set_subtraction_flag(true);
-                self.set_half_overflow_flag((a & 0x0F) < (0x0F & val));
-                self.set_overflow_flag(did_carry);
+                self.set_half_carry_flag((a & 0x0F) < (0x0F & val));
+                self.set_carry_flag(did_carry);
 
                 diff
             }
             3 => {
                 // sbc a, r8
-                let overflow = self.get_overflow_flag() as u8;
+                let overflow = self.get_carry_flag() as u8;
 
                 let (diff1, borrow1) = a.overflowing_sub(val);
                 let (diff, borrow2) = diff1.overflowing_sub(overflow);
 
                 self.set_subtraction_flag(true);
-                self.set_half_overflow_flag((a & 0x0F) < (0x0F & val) + overflow);
-                self.set_overflow_flag(borrow1 || borrow2);
+                self.set_half_carry_flag((a & 0x0F) < (0x0F & val) + overflow);
+                self.set_carry_flag(borrow1 || borrow2);
 
                 diff
             }
@@ -455,8 +633,8 @@ impl GameBoy {
                 let and = val & a;
 
                 self.set_subtraction_flag(false);
-                self.set_half_overflow_flag(true);
-                self.set_overflow_flag(false);
+                self.set_half_carry_flag(true);
+                self.set_carry_flag(false);
 
                 and
             }
@@ -465,8 +643,8 @@ impl GameBoy {
                 let xor = val ^ a;
 
                 self.set_subtraction_flag(false);
-                self.set_half_overflow_flag(false);
-                self.set_overflow_flag(false);
+                self.set_half_carry_flag(false);
+                self.set_carry_flag(false);
 
                 xor
             }
@@ -475,8 +653,8 @@ impl GameBoy {
                 let or = val | a;
 
                 self.set_subtraction_flag(false);
-                self.set_half_overflow_flag(false);
-                self.set_overflow_flag(false);
+                self.set_half_carry_flag(false);
+                self.set_carry_flag(false);
 
                 or
             }
@@ -486,8 +664,8 @@ impl GameBoy {
 
                 self.set_zero_flag(diff == 0);
                 self.set_subtraction_flag(true);
-                self.set_half_overflow_flag((0x0F & a) < (0x0F & val));
-                self.set_overflow_flag(did_carry);
+                self.set_half_carry_flag((0x0F & a) < (0x0F & val));
+                self.set_carry_flag(did_carry);
 
                 return; // instruction does not update the register A
             }
@@ -664,6 +842,10 @@ impl GameBoy {
         (self.hl >> 8) as u8
     }
 
+    fn get_register_vbk(&self) -> u8 {
+        self.ram[0xFF4F] & 1 | 0xFE
+    }
+
     fn set_zero_flag(&mut self, value: bool) {
         if value {
             self.af |= 0x0080;
@@ -680,7 +862,7 @@ impl GameBoy {
         }
     }
 
-    fn set_half_overflow_flag(&mut self, value: bool) {
+    fn set_half_carry_flag(&mut self, value: bool) {
         if value {
             self.af |= 0x0020;
         } else {
@@ -688,7 +870,7 @@ impl GameBoy {
         }
     }
 
-    fn set_overflow_flag(&mut self, value: bool) {
+    fn set_carry_flag(&mut self, value: bool) {
         if value {
             self.af |= 0x0010;
         } else {
@@ -697,10 +879,17 @@ impl GameBoy {
     }
 
     fn get_zero_flag(&self) -> bool {
-        (0x0080 & self.af) > 0
+        (self.af & 0x0080) > 0
     }
 
-    fn get_overflow_flag(&self) -> bool {
+    fn get_half_carry_flag(&self) -> bool {
+        (self.af & 0x0020) > 0
+    }
+
+    fn get_carry_flag(&self) -> bool {
         (self.af & 0x0010) > 0
+    }
+    fn get_subraction_flag(&self) -> bool {
+        (self.af & 0x0040) > 0
     }
 }
