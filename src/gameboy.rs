@@ -1,7 +1,20 @@
+use std::{io, thread, time::Duration};
+
+use crate::constants::{NINTENDO_LOGO, NINTENDO_LOGO_START_ADDR, VBK_ADDR, WRAM_BANK_SELECT};
+
 #[derive(Debug)]
 pub struct GameBoy {
-    ram: [u8; 32 * 1024],
-    vram: [u8; 16 * 1024],
+    catrigde_rom: [u8; 512 * 1024],
+    catridge_ram: [u8; 32 * 1024],
+
+    catridge_selected_rom: u8,
+    catridge_selected_ram: u8,
+
+    w_ram: [u8; 32 * 1024],
+    v_ram: [u8; 16 * 1024],
+    h_ram: [u8; 128],
+    oam: [u8; 160],
+    io_registers: [u8; 128],
 
     // GP registers
     af: u16,
@@ -16,52 +29,275 @@ pub struct GameBoy {
 
     // Interrupt Enable Flag
     ie: bool,
+
+    // misc
+    external_ram_enabled: bool,
 }
 
 impl GameBoy {
-    pub fn new() -> Self {
-        GameBoy {
-            ram: [0; 32 * 1024],
-            vram: [0; 16 * 1024],
-            af: 0,
-            bc: 0,
-            de: 0,
-            hl: 0,
-            sp: 0,
-            pc: 0,
-            ie: true,
+    pub fn new(rom: Vec<u8>) -> Self {
+        let mut gb = GameBoy {
+            af: 0x01B0,
+            bc: 0x0013,
+            de: 0x00D8,
+            hl: 0x014D,
+            sp: 0xFFFE,
+            pc: 0x1000,
+            ie: false, // disabled when game starts running
+
+            w_ram: [0; 32 * 1024],
+            v_ram: [0; 16 * 1024],
+            h_ram: [0; 128],
+            oam: [0; 160],
+            io_registers: [0; 128],
+
+            catrigde_rom: [0; 512 * 1024],
+            catridge_ram: [0; 32 * 1024],
+            external_ram_enabled: false,
+            catridge_selected_rom: 1,
+            catridge_selected_ram: 0,
+        };
+        gb.load_rom(rom);
+
+        // Load Nintendo Logo
+        // for (idx, val) in NINTENDO_LOGO.iter().enumerate() {
+        //     gb.ram[NINTENDO_LOGO_START_ADDR + idx] = *val;
+        // }
+        gb
+    }
+
+    fn load_rom(&mut self, rom: Vec<u8>) {
+        for i in 0..rom.len() {
+            self.catrigde_rom[0x1000 + i] = rom[i];
         }
     }
 
-    fn map_ram(&mut self, addr: u16) -> &mut u8 {
+    fn write_ram(&mut self, addr: u16, val: u8) {
+        let addr_usize = addr as usize;
+
         match addr {
-            0x0000..=0x3fff => {}
-            0x4000..=0x7fff => {}
-            0x8000..=0x9fff => {}
-            0xa000..=0xbfff => {}
-            0xc000..=0xcfff => {}
-            0xd000..=0xdfff => {}
-            0xe000..=0xfdff => {}
-            0xfe00..=0xfe9f => {}
-            0xfea0..=0xfeff => {}
-            0xff00..=0xff7f => {}
-            0xff80..=0xfffe => {}
+            0x0000..=0x1fff => {
+                // external RAM enabled by writing $A
+                if val & 0x0F == 0xA {
+                    self.external_ram_enabled = true;
+                }
+            }
+            0x2000..=0x3fff => {
+                // ROM Bank
+                let mut selected_bank = val & 0x1F;
+
+                if selected_bank == 0 {
+                    selected_bank = 1;
+                }
+
+                self.catridge_selected_rom = selected_bank;
+            }
+            0x4000..=0x5fff => {
+                // RAM Bank
+                self.catridge_selected_ram = 0x03 & val;
+            }
+            0x6000..=0x7fff => {
+                // ROM
+            }
+            0x8000..=0x9fff => {
+                // VRAM
+                if self.read_ram(VBK_ADDR) & 1 == 0 {
+                    self.v_ram[addr_usize - 0x8000 + 0x2000] = val;
+                }
+                self.v_ram[addr_usize - 0x8000] = val;
+            }
+            0xa000..=0xbfff => {
+                // 8 KiB External RAM
+                self.catridge_ram[addr_usize - 0xa000] = val;
+            }
+            0xc000..=0xcfff => {
+                // 4 KiB Work RAM (WRAM)
+                // Bank 0
+                self.w_ram[addr_usize - 0xc000] = val;
+            }
+            0xd000..=0xdfff => {
+                // switchable bank 1–7
+                let mut selected_bank =
+                    (self.io_registers[WRAM_BANK_SELECT - 0xff00] >> 5) as usize;
+
+                if selected_bank == 0 {
+                    selected_bank = 1; // 0 maps to Bank 1
+                }
+
+                self.w_ram[0x1000 * selected_bank + (addr_usize - 0xd000)] = val;
+            }
+            0xe000..=0xfdff => {
+                // Echo RAM (mirror of C000–DDFF)
+                self.write_ram(addr - 0x2000, val);
+            }
+            0xfe00..=0xfe9f => {
+                // Object attribute memory (OAM)
+            }
+            0xfea0..=0xfeff => {
+                // return 0xFF;
+            }
+            0xff00..=0xff7f => {
+                if addr == 0xFF02 {
+                    // If bit 7 (0x80) is set, a transfer is starting
+                    if val == 0x81 {
+                        let char_to_print = self.read_ram(0xFF01) as char;
+                        print!("{}", char_to_print);
+                    }
+                }
+                // I/O Registers
+                self.io_registers[addr_usize - 0xff00] = val;
+            }
+            0xff80..=0xfffe => {
+                // High RAM (HRAM)
+                self.h_ram[addr_usize - 0xff80] = val;
+            }
             0xffff => {}
         }
 
-        return &mut self.ram[0];
+        return;
     }
+
+    fn read_ram(&self, addr: u16) -> u8 {
+        let addr_usize = addr as usize;
+
+        match addr {
+            0x0000..=0x3fff => {
+                // 16 KiB ROM bank 00
+                return self.catrigde_rom[addr_usize];
+            }
+            0x4000..=0x7fff => {
+                // 16 KiB ROM Bank 01–NN
+                return self.catrigde_rom
+                    [0x4000 * self.catridge_selected_rom as usize - (addr_usize - 0x4000)];
+            }
+            0x8000..=0x9fff => {
+                // VRAM
+                if self.read_ram(VBK_ADDR) & 1 == 1 {
+                    return self.v_ram[0x2000 + addr_usize - 0x8000];
+                }
+                return self.v_ram[addr_usize - 0x8000];
+            }
+            0xa000..=0xbfff => {
+                // 8 KiB External RAM
+                return self.catridge_ram
+                    [0x2000 * self.catridge_selected_ram as usize - (addr_usize - 0xa000)];
+            }
+            0xc000..=0xcfff => {
+                // 4 KiB Work RAM (WRAM)
+                // Bank 0
+                return self.w_ram[addr_usize - 0xc000];
+            }
+            0xd000..=0xdfff => {
+                // switchable bank 1–7
+                // 4 KiB Work RAM (WRAM)
+                let mut selected_bank =
+                    (self.io_registers[WRAM_BANK_SELECT - 0xff00] >> 5) as usize;
+
+                if selected_bank == 0 {
+                    selected_bank = 1; // 0 maps to Bank 1
+                }
+
+                return self.w_ram[0x1000 * selected_bank + (addr_usize - 0xd000)];
+            }
+            0xe000..=0xfdff => {
+                // Echo RAM (mirror of C000–DDFF)
+                return self.read_ram(addr - 0x2000);
+            }
+            0xfe00..=0xfe9f => {
+                // Object attribute memory (OAM)
+                return self.oam[addr_usize - 0xfe00];
+            }
+            0xfea0..=0xfeff => {
+                return 0xFF;
+            }
+            0xff00..=0xff7f => {
+                // I/O Registers
+                return self.io_registers[addr_usize - 0xff00];
+            }
+            0xff80..=0xfffe => {
+                // High RAM (HRAM)
+                return self.h_ram[addr_usize - 0xff80];
+            }
+            0xffff => {
+                return 0xFF;
+            }
+        }
+    }
+
+    // fn map_ram(&mut self, addr: u16) -> &mut u8 {
+    //     let addr_usize = addr as usize;
+
+    //     match addr {
+    //         0x0000..=0x3fff => {
+    //             // 16 KiB ROM bank 00
+    //             return &mut self.catrigde_rom[addr_usize];
+    //         }
+    //         0x4000..=0x7fff => {
+    //             // 16 KiB ROM Bank 01–NN
+    //         }
+    //         0x8000..=0x9fff => {
+    //             // VRAM
+    //             if *self.map_ram(VBK_ADDR) & 1 == 0 {
+    //                 return &mut self.v_ram[addr_usize - 0x8000 + 0x2000];
+    //             }
+    //             return &mut self.v_ram[addr_usize - 0x8000];
+    //         }
+    //         0xa000..=0xbfff => {
+    //             // 8 KiB External RAM
+    //         }
+    //         0xc000..=0xcfff => {
+    //             // 4 KiB Work RAM (WRAM)
+    //             // Bank 0
+    //             return &mut self.w_ram[addr_usize - 0xc000];
+    //         }
+    //         0xd000..=0xdfff => {
+    //             // switchable bank 1–7
+    //             let mut selected_bank = (self.io_registers[WRAM_BANK_SELECT] >> 5) as usize;
+
+    //             if selected_bank == 0 {
+    //                 selected_bank = 1; // 0 maps to Bank 1
+    //             }
+
+    //             return &mut self.w_ram[0x1000 * selected_bank + (addr_usize - 0xd000)];
+    //         }
+    //         0xe000..=0xfdff => {
+    //             // Echo RAM (mirror of C000–DDFF)
+    //             return self.map_ram(addr - 0x2000);
+    //         }
+    //         0xfe00..=0xfe9f => {
+    //             // Object attribute memory (OAM)
+    //         }
+    //         0xfea0..=0xfeff => {
+    //             // return 0xFF;
+    //         }
+    //         0xff00..=0xff7f => {
+    //             // I/O Registers
+    //             return &mut self.io_registers[addr_usize - 0xff80];
+    //         }
+    //         0xff80..=0xfffe => {
+    //             // High RAM (HRAM)
+    //             return &mut self.h_ram[addr_usize - 0xff00];
+    //         }
+    //         0xffff => {}
+    //     }
+
+    //     todo!("map_ram not implemented");
+    // }
 
     pub fn main(&mut self) {
         loop {
             let opcode = self.fetch_value_u8();
             let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
-            if self.ram[0xff02] == 0x81 {
-                let c = self.ram[0xff01];
+            if self.read_ram(0xff02) == 0x81 {
+                let c = self.read_ram(0xff01);
                 println!("{}", c as char);
-                self.ram[0xff02] = 0x0;
+                self.write_ram(0xff02, 0x0);
             }
+
+            // println!("{}", self.pc);
+
+            // thread::sleep(Duration::from_millis(10));
 
             match x {
                 0 => {
@@ -71,6 +307,7 @@ impl GameBoy {
                         }
                         if y == 2 {
                             // TODO: stop
+                            println!("stop");
                         }
                         if y == 3 {
                             // jr imm8
@@ -95,15 +332,13 @@ impl GameBoy {
                     if z == 2 && (y & 0b001) == 0 {
                         // ld [r16mem], a
                         let a = self.get_register_a();
-                        let register = self.get_r16mem(y);
-
-                        *register = a;
+                        self.set_r16mem(y, a);
 
                         self.post_ins_r16mem(y);
                     }
                     if z == 2 && (y & 0b001) == 1 {
                         // ld a, [r16mem]
-                        let val = *self.get_r16mem(y);
+                        let val = self.get_r16mem(y);
                         self.set_register_a(val);
                         self.post_ins_r16mem(y);
                     }
@@ -112,11 +347,8 @@ impl GameBoy {
                         let addr = self.fetch_value_u16();
                         let sp = self.sp;
 
-                        let mem = self.map_ram(addr);
-                        *mem = sp as u8;
-
-                        let mem = self.map_ram(addr.wrapping_add(1));
-                        *mem = (sp >> 8) as u8;
+                        self.write_ram(addr, sp as u8);
+                        self.write_ram(addr.wrapping_add(1), (sp >> 8) as u8);
                     }
                     if z == 3 && (y & 0b001) == 0 {
                         // inc r16
@@ -228,7 +460,7 @@ impl GameBoy {
                                 // daa
                                 let mut a = self.get_register_a();
 
-                                if self.get_subraction_flag() {
+                                if self.get_subtraction_flag() {
                                     if self.get_half_carry_flag() {
                                         a = a.wrapping_sub(0x06);
                                     }
@@ -275,6 +507,7 @@ impl GameBoy {
                 1 => {
                     if y == 6 && z == 6 {
                         // TODO: halt
+                        println!("hello");
                     } else {
                         let val = self.get_r8(z);
                         self.set_r8(y, val);
@@ -367,44 +600,41 @@ impl GameBoy {
                         // ldh [c], a
                         let c = self.get_register_c();
                         let a = self.get_register_a();
-                        let mem = self.map_ram((0xFF00_u16).wrapping_add(c as u16));
 
-                        *mem = a;
+                        self.write_ram((0xFF00_u16).wrapping_add(c as u16), a);
                     }
                     if z == 0 && y == 4 {
                         // ldh [imm8], a
                         let val = self.fetch_value_u8() as u16;
                         let a = self.get_register_a();
-                        let mem = self.map_ram((0xFF00_u16).wrapping_add(val));
 
-                        *mem = a;
+                        self.write_ram((0xFF00_u16).wrapping_add(val), a);
                     }
                     if z == 2 && y == 5 {
                         // ld [imm16], a
                         let a = self.get_register_a();
                         let addr = self.fetch_value_u16();
-                        let mem = self.map_ram(addr);
 
-                        *mem = a;
+                        self.write_ram(addr, a);
                     }
                     if z == 2 && y == 6 {
                         // ldh a, [c]
                         let c = self.get_register_c();
-                        let val = *self.map_ram((0xFF00_u16).wrapping_add(c as u16));
+                        let val = self.read_ram((0xFF00_u16).wrapping_add(c as u16));
 
                         self.set_register_a(val);
                     }
                     if z == 0 && y == 6 {
                         // ldh a, [imm8]
                         let addr = self.fetch_value_u8() as u16;
-                        let val = *self.map_ram((0xFF00_u16).wrapping_add(addr));
+                        let val = self.read_ram((0xFF00_u16).wrapping_add(addr));
 
                         self.set_register_a(val);
                     }
                     if z == 2 && y == 7 {
                         // ld a, [imm16]
                         let addr = self.fetch_value_u16();
-                        let val = *self.map_ram(addr);
+                        let val = self.read_ram(addr);
 
                         self.set_register_a(val);
                     }
@@ -700,16 +930,26 @@ impl GameBoy {
         res
     }
 
-    fn get_r16mem(&mut self, y: u8) -> &mut u8 {
+    fn get_r16mem(&mut self, y: u8) -> u8 {
         let res = match y >> 1 {
-            0x0 => self.map_ram(self.bc),
-            0x1 => self.map_ram(self.de),
-            0x2 => self.map_ram(self.hl),
-            0x3 => self.map_ram(self.hl),
+            0x0 => self.read_ram(self.bc),
+            0x1 => self.read_ram(self.de),
+            0x2 => self.read_ram(self.hl),
+            0x3 => self.read_ram(self.hl),
             _ => panic!("Not supported"),
         };
 
         res
+    }
+
+    fn set_r16mem(&mut self, y: u8, val: u8) {
+        match y >> 1 {
+            0x0 => self.write_ram(self.bc, val),
+            0x1 => self.write_ram(self.de, val),
+            0x2 => self.write_ram(self.hl, val),
+            0x3 => self.write_ram(self.hl, val),
+            _ => panic!("Not supported"),
+        };
     }
 
     fn post_ins_r16mem(&mut self, y: u8) {
@@ -730,7 +970,7 @@ impl GameBoy {
             3 => self.get_register_e(),
             4 => self.get_register_h(),
             5 => self.get_register_l(),
-            6 => *self.map_ram(self.hl),
+            6 => self.read_ram(self.hl),
             7 => self.get_register_a(),
             _ => panic!("Trying to get r8 with {register}"),
         };
@@ -746,17 +986,14 @@ impl GameBoy {
             3 => self.set_register_e(val),
             4 => self.set_register_h(val),
             5 => self.set_register_l(val),
-            6 => {
-                let mem = self.map_ram(self.hl);
-                *mem = val;
-            }
+            6 => self.write_ram(self.hl, val),
             7 => self.set_register_a(val),
             _ => panic!("Trying to set r8 with {register}"),
         };
     }
 
     fn fetch_value_u8(&mut self) -> u8 {
-        let val = *self.map_ram(self.pc);
+        let val = self.read_ram(self.pc);
         self.pc = self.pc.wrapping_add(1);
 
         return val;
@@ -767,10 +1004,10 @@ impl GameBoy {
     }
 
     fn pop_from_stack(&mut self) -> u16 {
-        let mut val = *self.map_ram(self.pc) as u16;
+        let mut val = self.read_ram(self.sp) as u16;
         self.sp = self.sp.wrapping_add(1);
 
-        val |= (*self.map_ram(self.pc) as u16) << 8;
+        val |= (self.read_ram(self.sp) as u16) << 8;
         self.sp = self.sp.wrapping_add(1);
 
         return val;
@@ -778,12 +1015,10 @@ impl GameBoy {
 
     fn push_to_stack(&mut self, val: u16) {
         self.sp = self.sp.wrapping_sub(1);
-        let mem = self.map_ram(self.sp);
-        *mem = (val >> 8) as u8;
+        self.write_ram(self.sp, (val >> 8) as u8);
 
         self.sp = self.sp.wrapping_sub(1);
-        let mem = self.map_ram(self.sp);
-        *mem = val as u8;
+        self.write_ram(self.sp, val as u8);
     }
 
     fn set_register_a(&mut self, value: u8) {
@@ -842,10 +1077,6 @@ impl GameBoy {
         (self.hl >> 8) as u8
     }
 
-    fn get_register_vbk(&self) -> u8 {
-        self.ram[0xFF4F] & 1 | 0xFE
-    }
-
     fn set_zero_flag(&mut self, value: bool) {
         if value {
             self.af |= 0x0080;
@@ -889,7 +1120,7 @@ impl GameBoy {
     fn get_carry_flag(&self) -> bool {
         (self.af & 0x0010) > 0
     }
-    fn get_subraction_flag(&self) -> bool {
+    fn get_subtraction_flag(&self) -> bool {
         (self.af & 0x0040) > 0
     }
 }
