@@ -1,6 +1,9 @@
-use std::{io, thread, time::Duration};
+use std::{
+    io, thread,
+    time::{Duration, Instant},
+};
 
-use crate::constants::{VBK_ADDR, WRAM_BANK_SELECT};
+use crate::constants::{DIV_REGISTER, INTERRUPT_FLAG, VBK_ADDR, WRAM_BANK_SELECT};
 
 #[derive(Debug)]
 pub struct GameBoy {
@@ -27,9 +30,10 @@ pub struct GameBoy {
 
     interrupt_master_enable: bool, // Interrupt Master Enable Flag
     interrupt_enable: u8,          // Interrupt Enable
-    interrupt_flag: u8,            // Interrupt Flag
 
     external_ram_enabled: bool,
+    cpu_timer: u32,
+    cpu_halted: bool,
 }
 
 impl GameBoy {
@@ -40,7 +44,7 @@ impl GameBoy {
             de: 0x00D8,
             hl: 0x014D,
             sp: 0xFFFE,
-            pc: 0x0000,
+            pc: 0x3FF0,
 
             w_ram: [0; 32 * 1024],
             v_ram: [0; 16 * 1024],
@@ -55,8 +59,9 @@ impl GameBoy {
             catridge_selected_ram: 0,
 
             interrupt_master_enable: false, // disabled when game starts running
-            interrupt_flag: 0,
             interrupt_enable: 0,
+            cpu_timer: 0,
+            cpu_halted: false,
         };
 
         gb.load_rom(rom);
@@ -71,6 +76,8 @@ impl GameBoy {
     }
 
     fn write_ram(&mut self, addr: u16, val: u8) {
+        self.increment_cpu_timer(1);
+
         let addr_usize = addr as usize;
 
         match addr {
@@ -143,6 +150,11 @@ impl GameBoy {
                         print!("{}", char_to_print);
                     }
                 }
+                
+                if addr_usize == DIV_REGISTER {
+                    self.io_registers[addr_usize - 0xff00] = 0;
+                }
+
                 // I/O Registers
                 self.io_registers[addr_usize - 0xff00] = val;
             }
@@ -154,11 +166,11 @@ impl GameBoy {
                 self.interrupt_enable = val;
             }
         }
-
-        return;
     }
 
-    fn read_ram(&self, addr: u16) -> u8 {
+    fn read_ram(&mut self, addr: u16) -> u8 {
+        self.increment_cpu_timer(1);
+
         let addr_usize = addr as usize;
 
         match addr {
@@ -229,407 +241,474 @@ impl GameBoy {
 
     pub fn main(&mut self) {
         loop {
-            let opcode = self.fetch_value_u8();
-            let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
-
-            // if self.read_ram(0xff02) == 0x81 {
-            //     let c = self.read_ram(0xff01);
-            //     println!("{}", c as char);
-            //     self.write_ram(0xff02, 0x0);
-            // }
-
-            // println!("{} {opcode:x}", self.pc);
-
-            // thread::sleep(Duration::from_millis(10));
-
-            match x {
-                0 => {
-                    if z == 0 {
-                        if y == 0 {
-                            // nop
-                        }
-                        if y == 2 {
-                            // TODO: stop
-                            println!("stop");
-                        }
-                        if y == 3 {
-                            // jr imm8
-                            let new_add = self.fetch_value_u8() as i8;
-                            self.pc = self.pc.wrapping_add(new_add as i16 as u16);
-                        }
-                        if y & 0b100 > 1 {
-                            // jr cond, imm8
-                            let offset = self.fetch_value_u8() as i8;
-
-                            if self.check_condition(y) {
-                                self.pc = self.pc.wrapping_add(offset as i16 as u16);
-                            }
-                        }
-                    }
-                    if z == 1 && (y & 0b001) == 0 {
-                        // ld r16, imm16
-                        let val = self.fetch_value_u16();
-                        let register = self.get_r16(y);
-                        *register = val;
-                    }
-                    if z == 2 && (y & 0b001) == 0 {
-                        // ld [r16mem], a
-                        let a = self.get_register_a();
-                        self.set_r16mem(y, a);
-
-                        self.post_ins_r16mem(y);
-                    }
-                    if z == 2 && (y & 0b001) == 1 {
-                        // ld a, [r16mem]
-                        let val = self.get_r16mem(y);
-                        self.set_register_a(val);
-                        self.post_ins_r16mem(y);
-                    }
-                    if z == 0 && y == 1 {
-                        // ld [imm16], sp
-                        let addr = self.fetch_value_u16();
-                        let sp = self.sp;
-
-                        self.write_ram(addr, sp as u8);
-                        self.write_ram(addr.wrapping_add(1), (sp >> 8) as u8);
-                    }
-                    if z == 3 && (y & 0b001) == 0 {
-                        // inc r16
-                        let register = self.get_r16(y);
-                        let sum = (*register).wrapping_add(1);
-                        *register = sum;
-                    }
-                    if z == 3 && (y & 0b001) == 1 {
-                        // dec r16
-                        let register = self.get_r16(y);
-                        let sum = (*register).wrapping_sub(1);
-                        *register = sum;
-                    }
-                    if z == 1 && (y & 0b001) == 1 {
-                        // add hl, r16
-                        let register_val = *self.get_r16(y);
-                        let (sum, did_carry) = self.hl.overflowing_add(register_val);
-
-                        self.set_subtraction_flag(false);
-                        self.set_half_carry_flag(
-                            (register_val & 0x0FFF) + (self.hl & 0x0FFF) > 0x0FFF,
-                        );
-                        self.set_carry_flag(did_carry);
-
-                        self.hl = sum;
-                    }
-                    if z == 4 {
-                        // inc r8
-                        let register = self.get_r8(y);
-                        let sum = register.wrapping_add(1);
-
-                        self.set_zero_flag(sum == 0);
-                        self.set_subtraction_flag(false);
-                        self.set_half_carry_flag(register & 0x0F == 0x0F);
-
-                        self.set_r8(y, sum);
-                    }
-                    if z == 5 {
-                        // dec r8
-                        let register = self.get_r8(y);
-                        let diff = register.wrapping_sub(1);
-
-                        self.set_zero_flag(diff == 0);
-                        self.set_subtraction_flag(true);
-                        self.set_half_carry_flag(register & 0x0F == 0);
-
-                        self.set_r8(y, diff);
-                    }
-                    if z == 6 {
-                        // ld r8, imm8
-                        let val = self.fetch_value_u8();
-                        self.set_r8(y, val);
-                    }
-                    if z == 7 {
-                        match y {
-                            0 => {
-                                // rlca
-                                let a = self.get_register_a();
-                                let last_bit = a >> 7;
-
-                                self.set_zero_flag(false);
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag(last_bit == 1);
-
-                                self.set_register_a(a.rotate_left(1));
-                            }
-                            1 => {
-                                // rrca
-                                let a = self.get_register_a();
-                                let first_bit = a & 1;
-
-                                self.set_zero_flag(false);
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag(first_bit == 1);
-
-                                self.set_register_a(a.rotate_right(1));
-                            }
-                            2 => {
-                                // rla
-                                let a = self.get_register_a();
-                                let carry = self.get_carry_flag() as u8;
-
-                                self.set_zero_flag(false);
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag((a & 0x80) > 1);
-
-                                let res = (a << 1) | carry;
-
-                                self.set_register_a(res);
-                            }
-                            3 => {
-                                // rra
-                                let a = self.get_register_a();
-                                let carry = self.get_carry_flag() as u8;
-
-                                self.set_zero_flag(false);
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag((a & 1) == 1);
-
-                                let res = (a >> 1) | (carry << 7);
-
-                                self.set_register_a(res);
-                            }
-                            4 => {
-                                // daa
-                                let mut a = self.get_register_a();
-                                let mut adjust = 0u8;
-                                let mut carry = false;
-
-                                if self.get_subtraction_flag() {
-                                    if self.get_half_carry_flag() {
-                                        adjust |= 0x06;
-                                    }
-                                    if self.get_carry_flag() {
-                                        adjust |= 0x60;
-                                    }
-                                    a = a.wrapping_sub(adjust);
-                                } else {
-                                    if self.get_half_carry_flag() || (a & 0x0F) > 0x09 {
-                                        adjust |= 0x06;
-                                    }
-                                    if carry || a > 0x99 {
-                                        adjust |= 0x60;
-                                        carry = true;
-                                    } else {
-                                        carry = false;
-                                    }
-                                    a = a.wrapping_add(adjust);
-                                }
-
-                                self.set_zero_flag(a == 0);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag(carry);
-                                self.set_register_a(a);
-                            }
-                            5 => {
-                                // cpl
-                                self.set_register_a(!self.get_register_a());
-                                self.set_subtraction_flag(true);
-                                self.set_half_carry_flag(true);
-                            }
-                            6 => {
-                                // scf
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag(true);
-                            }
-                            7 => {
-                                // ccf
-                                self.set_subtraction_flag(false);
-                                self.set_half_carry_flag(false);
-                                self.set_carry_flag(!self.get_carry_flag());
-                            }
-                            _ => panic!("Invalid OP Code: {opcode}"),
-                        }
-                    }
+            if self.cpu_halted {
+                if self.read_ram(INTERRUPT_FLAG) & self.interrupt_enable & 0x0F > 1 {
+                    self.cpu_halted = false;
                 }
-                1 => {
-                    if y == 6 && z == 6 {
-                        // TODO: halt
-                        println!("hello");
-                    } else {
-                        let val = self.get_r8(z);
-                        self.set_r8(y, val);
-                    }
-                }
-                2 => {
-                    let val = self.get_r8(z);
-                    self.handle_alu_op(y, val);
-                }
-                3 => {
-                    if z == 6 {
-                        // alu ops
-                        let val = self.fetch_value_u8();
-                        self.handle_alu_op(y, val);
-                    }
-                    if z == 0 && (y & 0b100) == 0 {
-                        // ret cond
-                        if self.check_condition(y) {
-                            self.pc = self.pop_from_stack();
-                        }
-                    }
-                    if z == 1 && y == 1 {
-                        // ret
-                        self.pc = self.pop_from_stack();
-                    }
-                    if z == 1 && y == 3 {
-                        // reti
-                        self.interrupt_master_enable = true;
-                        self.pc = self.pop_from_stack();
-                    }
-                    if z == 2 && (y & 0b100) == 0 {
-                        // jp cond, imm16
-                        let addr = self.fetch_value_u16();
+            }
 
-                        if self.check_condition(y) {
-                            self.pc = addr;
-                        }
-                    }
-                    if z == 3 && y == 0 {
-                        // jp imm16
-                        self.pc = self.fetch_value_u16();
-                    }
-                    if z == 1 && y == 5 {
-                        // jp hl
-                        self.pc = self.hl;
-                    }
-                    if z == 4 && (y & 0b100) == 0 {
-                        // call cond, imm16
-                        let val = self.fetch_value_u16();
-
-                        if self.check_condition(y) {
-                            self.push_to_stack(self.pc);
-                            self.pc = val;
-                        }
-                    }
-                    if z == 5 && y == 1 {
-                        // call imm16
-                        let val = self.fetch_value_u16();
-                        self.push_to_stack(self.pc);
-                        self.pc = val;
-                    }
-                    if z == 7 {
-                        // rst tgt3
-                        self.push_to_stack(self.pc);
-                        self.pc = 0x0000 + (8 * y as u16); // JMP to offset + (y * 8)
-                    }
-                    if z == 1 && (y & 0b001) == 0 {
-                        // pop r16stk
-                        let val = self.pop_from_stack();
-
-                        if y == 6 {
-                            // force the bottom 4 bits to 0
-                            self.af = val & 0xFFF0;
-                        } else {
-                            let register = self.get_r16stk(y);
-                            *register = val;
-                        }
-                    }
-                    if z == 5 && (y & 0b001) == 0 {
-                        // push r16stk
-                        let register = *self.get_r16stk(y);
-                        self.push_to_stack(register);
-                    }
-                    if z == 3 && y == 1 {
-                        // $CB prefix instructions
-                        let ins = self.fetch_value_u8();
-                        self.handle_prefix_cb_instruction(ins);
-                    }
-                    if z == 2 && y == 4 {
-                        // ldh [c], a
-                        let c = self.get_register_c();
-                        let a = self.get_register_a();
-
-                        self.write_ram((0xFF00_u16).wrapping_add(c as u16), a);
-                    }
-                    if z == 0 && y == 4 {
-                        // ldh [imm8], a
-                        let val = self.fetch_value_u8() as u16;
-                        let a = self.get_register_a();
-
-                        self.write_ram((0xFF00_u16).wrapping_add(val), a);
-                    }
-                    if z == 2 && y == 5 {
-                        // ld [imm16], a
-                        let a = self.get_register_a();
-                        let addr = self.fetch_value_u16();
-
-                        self.write_ram(addr, a);
-                    }
-                    if z == 2 && y == 6 {
-                        // ldh a, [c]
-                        let c = self.get_register_c();
-                        let val = self.read_ram((0xFF00_u16).wrapping_add(c as u16));
-
-                        self.set_register_a(val);
-                    }
-                    if z == 0 && y == 6 {
-                        // ldh a, [imm8]
-                        let addr = self.fetch_value_u8() as u16;
-                        let val = self.read_ram((0xFF00_u16).wrapping_add(addr));
-
-                        self.set_register_a(val);
-                    }
-                    if z == 2 && y == 7 {
-                        // ld a, [imm16]
-                        let addr = self.fetch_value_u16();
-                        let val = self.read_ram(addr);
-
-                        self.set_register_a(val);
-                    }
-                    if z == 0 && y == 5 {
-                        // add sp, imm8
-                        let val = self.fetch_value_u8();
-                        let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
-
-                        self.set_zero_flag(false);
-                        self.set_subtraction_flag(false);
-                        self.set_half_carry_flag((0x0F & self.sp) + (0x0F & (val as u16)) > 0x0F);
-                        self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
-
-                        self.sp = sum;
-                    }
-                    if z == 0 && y == 7 {
-                        // ld hl, sp + imm8
-                        let val = self.fetch_value_u8();
-                        let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
-
-                        self.set_zero_flag(false);
-                        self.set_subtraction_flag(false);
-                        self.set_half_carry_flag((self.sp & 0x0F) + (val as u16 & 0x0F) > 0x0F);
-                        self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
-
-                        self.hl = sum;
-                    }
-                    if z == 1 && y == 7 {
-                        // ld sp, hl
-                        self.sp = self.hl;
-                    }
-                    if z == 3 && y == 6 {
-                        // di
-                        self.interrupt_master_enable = false;
-                    }
-                    if z == 3 && y == 7 {
-                        // ei
-                        self.interrupt_master_enable = true;
-                    }
-                }
-                _ => {}
+            if !self.cpu_halted {
+                self.fde();
+                self.update_timers();
             }
         }
     }
 
-    fn check_condition(&self, y: u8) -> bool {
+    // pub fn handle_interrupt(&mut self) {
+    //     if !self.interrupt_master_enable {
+    //         return;
+    //     }
+    //
+    //     for i in 0..=4 {
+    //         if (self.interrupt_enable >> i) & (self.read_ram(INTERRUPT_FLAG) >> i) & 1 != 1 {
+    //             continue;
+    //         }
+
+    //         self.clear_interrupt(i);
+    //         self.interrupt_master_enable = false;
+    //         self.push_to_stack(self.pc);
+
+    //         match i {
+    //             0 => 0x0040, // VBlank
+    //             1 => 0x0048, // LCD STAT
+    //             2 => 0x0050, // Timer
+    //             3 => 0x0058, // Serial
+    //             4 => 0x0060, // Joypad
+    //             _ => panic!("Invalid Interrupt {i}"),
+    //         };
+
+    //         break;
+    //     }
+    // }
+
+    fn update_timers(&mut self) {
+        self.io_registers[DIV_REGISTER - 0xff00] = (self.cpu_timer / 128) as u8; 
+    }
+
+    fn fde(&mut self) {
+        let opcode = self.fetch_value_u8();
+        let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
+
+        // println!("{opcode} {:x}", self.pc);
+        // thread::sleep(Duration::from_millis(1));
+
+        match x {
+            0 => {
+                if z == 0 {
+                    if y == 0 {
+                        // nop
+                    }
+                    if y == 2 {
+                        // TODO: stop
+                    }
+                    if y == 3 {
+                        // jr imm8
+                        let new_add = self.fetch_value_u8() as i8;
+                        self.pc = self.pc.wrapping_add(new_add as i16 as u16);
+
+                        self.increment_cpu_timer(1);
+                    }
+                    if y & 0b100 > 1 {
+                        // jr cond, imm8
+                        let offset = self.fetch_value_u8() as i8;
+
+                        if self.check_condition(y) {
+                            self.increment_cpu_timer(1);
+                            self.pc = self.pc.wrapping_add(offset as i16 as u16);
+                        }
+                    }
+                }
+                if z == 1 && (y & 0b001) == 0 {
+                    // ld r16, imm16
+                    let val = self.fetch_value_u16();
+                    let register = self.get_r16(y);
+
+                    *register = val;
+                }
+                if z == 2 && (y & 0b001) == 0 {
+                    // ld [r16mem], a
+                    let a = self.get_register_a();
+
+                    self.set_r16mem(y, a);
+                    self.post_ins_r16mem(y);
+                }
+                if z == 2 && (y & 0b001) == 1 {
+                    // ld a, [r16mem]
+                    let val = self.get_r16mem(y);
+
+                    self.set_register_a(val);
+                    self.post_ins_r16mem(y);
+                }
+                if z == 0 && y == 1 {
+                    // ld [imm16], sp
+                    let addr = self.fetch_value_u16();
+                    let sp = self.sp;
+
+                    self.write_ram(addr, sp as u8);
+                    self.write_ram(addr.wrapping_add(1), (sp >> 8) as u8);
+                }
+                if z == 3 && (y & 0b001) == 0 {
+                    // inc r16
+                    let register = self.get_r16(y);
+                    let sum = (*register).wrapping_add(1);
+
+                    *register = sum;
+
+                    self.increment_cpu_timer(1);
+                }
+                if z == 3 && (y & 0b001) == 1 {
+                    // dec r16
+                    let register = self.get_r16(y);
+                    let sum = (*register).wrapping_sub(1);
+
+                    *register = sum;
+
+                    self.increment_cpu_timer(1);
+                }
+                if z == 1 && (y & 0b001) == 1 {
+                    // add hl, r16
+                    let register_val = *self.get_r16(y);
+                    let (sum, did_carry) = self.hl.overflowing_add(register_val);
+
+                    self.set_subtraction_flag(false);
+                    self.set_half_carry_flag((register_val & 0x0FFF) + (self.hl & 0x0FFF) > 0x0FFF);
+                    self.set_carry_flag(did_carry);
+
+                    self.hl = sum;
+
+                    self.increment_cpu_timer(1);
+                }
+                if z == 4 {
+                    // inc r8
+                    let register = self.get_r8(y);
+                    let sum = register.wrapping_add(1);
+
+                    self.set_zero_flag(sum == 0);
+                    self.set_subtraction_flag(false);
+                    self.set_half_carry_flag(register & 0x0F == 0x0F);
+
+                    self.set_r8(y, sum);
+                }
+                if z == 5 {
+                    // dec r8
+                    let register = self.get_r8(y);
+                    let diff = register.wrapping_sub(1);
+
+                    self.set_zero_flag(diff == 0);
+                    self.set_subtraction_flag(true);
+                    self.set_half_carry_flag(register & 0x0F == 0);
+
+                    self.set_r8(y, diff);
+                }
+                if z == 6 {
+                    // ld r8, imm8
+                    let val = self.fetch_value_u8();
+                    self.set_r8(y, val);
+                }
+                if z == 7 {
+                    match y {
+                        0 => {
+                            // rlca
+                            let a = self.get_register_a();
+                            let last_bit = a >> 7;
+
+                            self.set_zero_flag(false);
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag(last_bit == 1);
+
+                            self.set_register_a(a.rotate_left(1));
+                        }
+                        1 => {
+                            // rrca
+                            let a = self.get_register_a();
+                            let first_bit = a & 1;
+
+                            self.set_zero_flag(false);
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag(first_bit == 1);
+
+                            self.set_register_a(a.rotate_right(1));
+                        }
+                        2 => {
+                            // rla
+                            let a = self.get_register_a();
+                            let carry = self.get_carry_flag() as u8;
+
+                            self.set_zero_flag(false);
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag((a & 0x80) > 1);
+
+                            let res = (a << 1) | carry;
+
+                            self.set_register_a(res);
+                        }
+                        3 => {
+                            // rra
+                            let a = self.get_register_a();
+                            let carry = self.get_carry_flag() as u8;
+
+                            self.set_zero_flag(false);
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag((a & 1) == 1);
+
+                            let res = (a >> 1) | (carry << 7);
+
+                            self.set_register_a(res);
+                        }
+                        4 => {
+                            // daa
+                            let mut a = self.get_register_a();
+                            let mut adjust = 0u8;
+                            let mut carry = self.get_carry_flag();
+
+                            if self.get_subtraction_flag() {
+                                if self.get_half_carry_flag() {
+                                    adjust |= 0x06;
+                                }
+                                if carry {
+                                    adjust |= 0x60;
+                                }
+                                a = a.wrapping_sub(adjust);
+                            } else {
+                                if self.get_half_carry_flag() || (a & 0x0F) > 0x09 {
+                                    adjust |= 0x06;
+                                }
+                                if carry || a > 0x99 {
+                                    adjust |= 0x60;
+                                    carry = true;
+                                }
+                                a = a.wrapping_add(adjust);
+                            }
+
+                            self.set_zero_flag(a == 0);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag(carry);
+                            self.set_register_a(a);
+                        }
+                        5 => {
+                            // cpl
+                            self.set_register_a(!self.get_register_a());
+                            self.set_subtraction_flag(true);
+                            self.set_half_carry_flag(true);
+                        }
+                        6 => {
+                            // scf
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag(true);
+                        }
+                        7 => {
+                            // ccf
+                            self.set_subtraction_flag(false);
+                            self.set_half_carry_flag(false);
+                            self.set_carry_flag(!self.get_carry_flag());
+                        }
+                        _ => panic!("Invalid OP Code: {opcode}"),
+                    }
+                }
+            }
+            1 => {
+                if y == 6 && z == 6 {
+                    // TODO: halt
+                    self.cpu_halted = true;
+                    println!("Halted");
+                } else {
+                    let val = self.get_r8(z);
+                    self.set_r8(y, val);
+                }
+            }
+            2 => {
+                let val = self.get_r8(z);
+                self.handle_alu_op(y, val);
+            }
+            3 => {
+                if z == 6 {
+                    // alu ops
+                    let val = self.fetch_value_u8();
+                    self.handle_alu_op(y, val);
+                }
+                if z == 0 && (y & 0b100) == 0 {
+                    // ret cond
+                    self.increment_cpu_timer(1);
+
+                    if self.check_condition(y) {
+                        self.pc = self.pop_from_stack();
+                        self.increment_cpu_timer(1);
+                    }
+                }
+                if z == 1 && y == 1 {
+                    // ret
+                    self.pc = self.pop_from_stack();
+                    self.increment_cpu_timer(1);
+                }
+                if z == 1 && y == 3 {
+                    // reti
+                    self.interrupt_master_enable = true;
+                    self.pc = self.pop_from_stack();
+                    self.increment_cpu_timer(1);
+                }
+                if z == 2 && (y & 0b100) == 0 {
+                    // jp cond, imm16
+                    let addr = self.fetch_value_u16();
+
+                    if self.check_condition(y) {
+                        self.pc = addr;
+                        self.increment_cpu_timer(1);
+                    }
+                }
+                if z == 3 && y == 0 {
+                    // jp imm16
+                    self.pc = self.fetch_value_u16();
+                    self.increment_cpu_timer(1);
+                }
+                if z == 1 && y == 5 {
+                    // jp hl
+                    self.pc = self.hl;
+                }
+                if z == 4 && (y & 0b100) == 0 {
+                    // call cond, imm16
+                    let val = self.fetch_value_u16();
+
+                    if self.check_condition(y) {
+                        self.push_to_stack(self.pc);
+                        self.pc = val;
+                        self.increment_cpu_timer(1);
+                    }
+                }
+                if z == 5 && y == 1 {
+                    // call imm16
+                    let val = self.fetch_value_u16();
+                    self.push_to_stack(self.pc);
+                    self.pc = val;
+                    self.increment_cpu_timer(1);
+                }
+                if z == 7 {
+                    // rst tgt3
+                    self.push_to_stack(self.pc);
+                    self.pc = 0x0000 + (8 * y as u16); // JMP to offset + (y * 8)
+                    self.increment_cpu_timer(1);
+                }
+                if z == 1 && (y & 0b001) == 0 {
+                    // pop r16stk
+                    let val = self.pop_from_stack();
+
+                    if y == 6 {
+                        // force the bottom 4 bits to 0
+                        self.af = val & 0xFFF0;
+                    } else {
+                        let register = self.get_r16stk(y);
+                        *register = val;
+                    }
+                }
+                if z == 5 && (y & 0b001) == 0 {
+                    // push r16stk
+                    let mut register = *self.get_r16stk(y);
+
+                    if y == 6 {
+                        register &= 0xFFF0;
+                    }
+
+                    self.push_to_stack(register);
+                    self.increment_cpu_timer(1);
+                }
+                if z == 3 && y == 1 {
+                    // $CB prefix instructions
+                    let ins = self.fetch_value_u8();
+                    self.handle_prefix_cb_instruction(ins);
+                }
+                if z == 2 && y == 4 {
+                    // ldh [c], a
+                    let c = self.get_register_c();
+                    let a = self.get_register_a();
+
+                    self.write_ram((0xFF00_u16).wrapping_add(c as u16), a);
+                }
+                if z == 0 && y == 4 {
+                    // ldh [imm8], a
+                    let val = self.fetch_value_u8() as u16;
+                    let a = self.get_register_a();
+
+                    self.write_ram((0xFF00_u16).wrapping_add(val), a);
+                }
+                if z == 2 && y == 5 {
+                    // ld [imm16], a
+                    let a = self.get_register_a();
+                    let addr = self.fetch_value_u16();
+
+                    self.write_ram(addr, a);
+                }
+                if z == 2 && y == 6 {
+                    // ldh a, [c]
+                    let c = self.get_register_c();
+                    let val = self.read_ram((0xFF00_u16).wrapping_add(c as u16));
+
+                    self.set_register_a(val);
+                }
+                if z == 0 && y == 6 {
+                    // ldh a, [imm8]
+                    let addr = self.fetch_value_u8() as u16;
+                    let val = self.read_ram((0xFF00_u16).wrapping_add(addr));
+
+                    self.set_register_a(val);
+                }
+                if z == 2 && y == 7 {
+                    // ld a, [imm16]
+                    let addr = self.fetch_value_u16();
+                    let val = self.read_ram(addr);
+
+                    self.set_register_a(val);
+                }
+                if z == 0 && y == 5 {
+                    // add sp, imm8
+                    let val = self.fetch_value_u8();
+                    let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
+
+                    self.set_zero_flag(false);
+                    self.set_subtraction_flag(false);
+                    self.set_half_carry_flag((0x0F & self.sp) + (0x0F & (val as u16)) > 0x0F);
+                    self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+
+                    self.sp = sum;
+
+                    self.increment_cpu_timer(2);
+                }
+                if z == 0 && y == 7 {
+                    // ld hl, sp + imm8
+                    let val = self.fetch_value_u8();
+                    let sum = self.sp.wrapping_add(val as i8 as i16 as u16);
+
+                    self.set_zero_flag(false);
+                    self.set_subtraction_flag(false);
+                    self.set_half_carry_flag((self.sp & 0x0F) + (val as u16 & 0x0F) > 0x0F);
+                    self.set_carry_flag((self.sp & 0xFF) + (val as u16 & 0xFF) > 0xFF);
+
+                    self.hl = sum;
+
+                    self.increment_cpu_timer(1);
+                }
+                if z == 1 && y == 7 {
+                    // ld sp, hl
+                    self.sp = self.hl;
+                    self.increment_cpu_timer(1);
+                }
+                if z == 3 && y == 6 {
+                    // di
+                    self.interrupt_master_enable = false;
+                }
+                if z == 3 && y == 7 {
+                    // ei
+                    self.interrupt_master_enable = true;
+                }
+            }
+            _ => panic!("Invalid OP code {opcode}"),
+        }
+    }
+
+    fn check_condition(&mut self, y: u8) -> bool {
         let res = match y & !0b100 {
             0 => !self.get_zero_flag(),
             1 => self.get_zero_flag(),
@@ -724,7 +803,7 @@ impl GameBoy {
                         // srl r8
                         self.set_subtraction_flag(false);
                         self.set_half_carry_flag(false);
-                        self.set_carry_flag(register & 1 == 0);
+                        self.set_carry_flag(register & 1 == 1);
 
                         register >> 1
                     }
@@ -919,7 +998,7 @@ impl GameBoy {
             3 => self.get_register_e(),
             4 => self.get_register_h(),
             5 => self.get_register_l(),
-            6 => self.read_ram(self.hl),
+            6 => self.read_ram(self.hl), 
             7 => self.get_register_a(),
             _ => panic!("Trying to get r8 with {register}"),
         };
@@ -1074,23 +1153,53 @@ impl GameBoy {
         (self.af & 0x0040) > 0
     }
 
-    fn get_vblank_interrupt_enabled(&self) -> bool {
-        self.interrupt_enable & 1 == 1
+    // fn is_vblank_interrupt_requested(&self) -> bool {
+    //     self.read_ram(INTERRUPT_FLAG) & 1 == 1
+    // }
+
+    // fn is_lcd_interrupt_requested(&self) -> bool {
+    //     (self.read_ram(INTERRUPT_FLAG) >> 1) & 1 == 1
+    // }
+
+    // fn is_timer_interrupt_requesis(&self) -> bool {
+    //     (self.read_ram(INTERRUPT_FLAG) >> 2) & 1 == 1
+    // }
+
+    // fn is_serial_interrupt_requested(&self) -> bool {
+    //     (self.read_ram(INTERRUPT_FLAG) >> 3) & 1 == 1
+    // }
+
+    // fn is_joypad_interrupt_requested(&self) -> bool {
+    //     (self.read_ram(INTERRUPT_FLAG) >> 4) & 1 == 1
+    // }
+
+    // fn is_vblank_interrupt_enabled(&self) -> bool {
+    //     self.interrupt_enable & 1 == 1
+    // }
+
+    // fn is_lcd_interrupt_enabled(&self) -> bool {
+    //     (self.interrupt_enable >> 1) & 1 == 1
+    // }
+
+    // fn is_timer_interrupt_enabled(&self) -> bool {
+    //     (self.interrupt_enable >> 2) & 1 == 1
+    // }
+
+    // fn is_serial_interrupt_enabled(&self) -> bool {
+    //     (self.interrupt_enable >> 3) & 1 == 1
+    // }
+
+    // fn is_joypad_interrupt_enabled(&self) -> bool {
+    //     (self.interrupt_enable >> 4) & 1 == 1
+    // }
+
+    fn clear_interrupt(&mut self, idx: u8) {
+        self.interrupt_enable = self.interrupt_enable & !(1 << idx);
+        let interrupt_flag = self.read_ram(INTERRUPT_FLAG);
+        self.write_ram(INTERRUPT_FLAG, interrupt_flag & !(1 << idx));
     }
 
-    fn get_lcd_interrupt_enabled(&self) -> bool {
-        (self.interrupt_enable >> 1) & 1 == 1
-    }
-
-    fn get_timer_interrupt_enabled(&self) -> bool {
-        (self.interrupt_enable >> 2) & 1 == 1
-    }
-
-    fn get_serial_interrupt_enabled(&self) -> bool {
-        (self.interrupt_enable >> 3) & 1 == 1
-    }
-
-    fn get_joypad_interrupt_enabled(&self) -> bool {
-        (self.interrupt_enable >> 4) & 1 == 1
+    fn increment_cpu_timer(&mut self, value: u32) {
+        self.cpu_timer = self.cpu_timer.wrapping_add(value);
     }
 }
