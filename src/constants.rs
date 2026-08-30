@@ -5,8 +5,8 @@ pub const NINTENDO_LOGO: [u8; 48] = [
 ];
 
 pub const NINTENDO_LOGO_START_ADDR: u16 = 0x0104;
-pub const VBK_ADDR: u16 = 0xFF4F;
+pub const VBK_ADDR: usize = 0xFF4F;
 pub const WRAM_BANK_SELECT: usize = 0xFF70;
 pub const DIV_REGISTER: usize = 0xFF04;
 pub const CLOCK_SPEED: u32 = 8_388_608;
-pub const INTERRUPT_FLAG: u16 = 0xFF0F;
+pub const INTERRUPT_FLAG: usize = 0xFF0F;

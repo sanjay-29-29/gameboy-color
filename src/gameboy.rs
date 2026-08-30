@@ -29,10 +29,15 @@ pub struct GameBoy {
     pc: u16, // Program Counter
 
     interrupt_master_enable: bool, // Interrupt Master Enable Flag
+    ei_executed: bool,             // Flag to show whether EI instruction is called
     interrupt_enable: u8,          // Interrupt Enable
 
     external_ram_enabled: bool,
-    cpu_timer: u32,
+    
+    m_cycles: i16,
+    instruction_m_cycle: i16,
+    div_counter: i16,
+
     cpu_halted: bool,
 }
 
@@ -44,7 +49,7 @@ impl GameBoy {
             de: 0x00D8,
             hl: 0x014D,
             sp: 0xFFFE,
-            pc: 0x3FF0,
+            pc: 0x1000,
 
             w_ram: [0; 32 * 1024],
             v_ram: [0; 16 * 1024],
@@ -60,7 +65,12 @@ impl GameBoy {
 
             interrupt_master_enable: false, // disabled when game starts running
             interrupt_enable: 0,
-            cpu_timer: 0,
+            ei_executed: false,
+            
+            m_cycles: 0,
+            instruction_m_cycle: 0,
+            div_counter: 0,
+
             cpu_halted: false,
         };
 
@@ -80,10 +90,18 @@ impl GameBoy {
 
         let addr_usize = addr as usize;
 
+        if addr == 0xFF02 {
+            // If bit 7 (0x80) is set, a transfer is starting
+            if val == 0x81 {
+                let char_to_print = self.io_registers[1] as char;
+                print!("{}", char_to_print);
+            }
+        }
+
         match addr {
             0x0000..=0x1fff => {
                 // external RAM enabled by writing $A
-                if val & 0x0F == 0xA {
+                if val & 0x0F == 0x0A {
                     self.external_ram_enabled = true;
                 }
             }
@@ -99,21 +117,25 @@ impl GameBoy {
             }
             0x4000..=0x5fff => {
                 // RAM Bank
-                self.catridge_selected_ram = 0x03 & val;
+                self.catridge_selected_ram = 0b11 & val;
             }
             0x6000..=0x7fff => {
                 // ROM
             }
             0x8000..=0x9fff => {
                 // VRAM
-                if self.read_ram(VBK_ADDR) & 1 == 0 {
-                    self.v_ram[0x2000 + (addr_usize - 0x8000)] = val;
+                let mut base_addr: usize = 0;
+
+                if self.io_registers[VBK_ADDR - 0xff00] & 1 == 1 {
+                    base_addr = 0x2000;
                 }
-                self.v_ram[addr_usize - 0x8000] = val;
+
+                self.v_ram[base_addr + (addr_usize - 0x8000)] = val;
             }
             0xa000..=0xbfff => {
                 // 8 KiB External RAM
-                self.catridge_ram[addr_usize - 0xa000] = val;
+                self.catridge_ram
+                    [(0x2000 * self.catridge_selected_ram as usize) + (addr_usize - 0xa000)] = val;
             }
             0xc000..=0xcfff => {
                 // 4 KiB Work RAM (WRAM)
@@ -121,9 +143,10 @@ impl GameBoy {
                 self.w_ram[addr_usize - 0xc000] = val;
             }
             0xd000..=0xdfff => {
+                // 4 KiB Work RAM (WRAM)
                 // switchable bank 1–7
                 let mut selected_bank =
-                    (self.io_registers[WRAM_BANK_SELECT - 0xff00] >> 5) as usize;
+                    (self.io_registers[WRAM_BANK_SELECT - 0xff00] & 0b111) as usize;
 
                 if selected_bank == 0 {
                     selected_bank = 1; // 0 maps to Bank 1
@@ -133,29 +156,21 @@ impl GameBoy {
             }
             0xe000..=0xfdff => {
                 // Echo RAM (mirror of C000–DDFF)
-                self.write_ram(addr - 0x2000, val);
+                self.w_ram[addr_usize - 0xe000] = val;
             }
             0xfe00..=0xfe9f => {
                 // Object attribute memory (OAM)
                 self.oam[addr_usize - 0xfe00] = val;
             }
-            0xfea0..=0xfeff => {
-                // return 0xFF;
-            }
+            // 0xfea0..=0xfeff => {
+            //     // return 0xFF;
+            // }
             0xff00..=0xff7f => {
-                if addr == 0xFF02 {
-                    // If bit 7 (0x80) is set, a transfer is starting
-                    if val == 0x81 {
-                        let char_to_print = self.read_ram(0xFF01) as char;
-                        print!("{}", char_to_print);
-                    }
-                }
-                
-                if addr_usize == DIV_REGISTER {
-                    self.io_registers[addr_usize - 0xff00] = 0;
-                }
-
                 // I/O Registers
+                if addr_usize == DIV_REGISTER {
+                    self.io_registers[addr_usize] = 0;
+                    self.div_counter = 0;
+                }
                 self.io_registers[addr_usize - 0xff00] = val;
             }
             0xff80..=0xfffe => {
@@ -164,6 +179,9 @@ impl GameBoy {
             }
             0xffff => {
                 self.interrupt_enable = val;
+            }
+            _ => {
+                self.catrigde_rom[addr_usize] = val;
             }
         }
     }
@@ -187,7 +205,7 @@ impl GameBoy {
                 // VRAM
                 let mut base_addr: usize = 0;
 
-                if self.read_ram(VBK_ADDR) & 1 == 1 {
+                if self.io_registers[VBK_ADDR - 0xff00] & 1 == 1 {
                     base_addr = 0x2000;
                 }
 
@@ -206,7 +224,8 @@ impl GameBoy {
             0xd000..=0xdfff => {
                 // switchable bank 1–7
                 // 4 KiB Work RAM (WRAM)
-                let mut selected_bank = (self.read_ram(WRAM_BANK_SELECT as u16) & 0x07) as usize;
+                let mut selected_bank =
+                    (self.io_registers[WRAM_BANK_SELECT - 0xff00] & 0b111) as usize;
 
                 if selected_bank == 0 {
                     selected_bank = 1; // 0 maps to Bank 1
@@ -216,17 +235,18 @@ impl GameBoy {
             }
             0xe000..=0xfdff => {
                 // Echo RAM (mirror of C000–DDFF)
-                return self.read_ram(addr - 0x2000);
+                return self.w_ram[addr_usize - 0xe000];
             }
             0xfe00..=0xfe9f => {
                 // Object attribute memory (OAM)
                 return self.oam[addr_usize - 0xfe00];
             }
-            0xfea0..=0xfeff => {
-                return 0xFF;
-            }
+            // 0xfea0..=0xfeff => {
+            //     return 0xFF;
+            // }
             0xff00..=0xff7f => {
                 // I/O Registers
+                if addr_usize == DIV_REGISTER {}
                 return self.io_registers[addr_usize - 0xff00];
             }
             0xff80..=0xfffe => {
@@ -236,53 +256,73 @@ impl GameBoy {
             0xffff => {
                 return self.interrupt_enable;
             }
+            _ => {
+                return self.catrigde_rom[addr_usize];
+            }
         }
     }
 
     pub fn main(&mut self) {
         loop {
             if self.cpu_halted {
-                if self.read_ram(INTERRUPT_FLAG) & self.interrupt_enable & 0x0F > 1 {
+                if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x0F > 1 {
                     self.cpu_halted = false;
                 }
             }
 
             if !self.cpu_halted {
+                self.handle_interrupt();
                 self.fde();
                 self.update_timers();
             }
         }
     }
 
-    // pub fn handle_interrupt(&mut self) {
-    //     if !self.interrupt_master_enable {
-    //         return;
-    //     }
-    //
-    //     for i in 0..=4 {
-    //         if (self.interrupt_enable >> i) & (self.read_ram(INTERRUPT_FLAG) >> i) & 1 != 1 {
-    //             continue;
-    //         }
+    pub fn handle_interrupt(&mut self) {
+        if self.ei_executed {
+            // The effect of ei is delayed by one instruction
+            self.ei_executed = false;
+            self.interrupt_master_enable = true;
+            return;
+        }
 
-    //         self.clear_interrupt(i);
-    //         self.interrupt_master_enable = false;
-    //         self.push_to_stack(self.pc);
+        if !self.interrupt_master_enable {
+            return;
+        }
 
-    //         match i {
-    //             0 => 0x0040, // VBlank
-    //             1 => 0x0048, // LCD STAT
-    //             2 => 0x0050, // Timer
-    //             3 => 0x0058, // Serial
-    //             4 => 0x0060, // Joypad
-    //             _ => panic!("Invalid Interrupt {i}"),
-    //         };
+        for i in 0..=4 {
+            if (self.interrupt_enable >> i) & (self.io_registers[INTERRUPT_FLAG - 0xff00] >> i) == 0
+            {
+                continue;
+            }
 
-    //         break;
-    //     }
-    // }
+            self.increment_cpu_timer(3);
+
+            self.clear_interrupt(i);
+            self.interrupt_master_enable = false;
+            self.push_to_stack(self.pc);
+
+            match i {
+                0 => 0x0040, // VBlank
+                1 => 0x0048, // LCD STAT
+                2 => 0x0050, // Timer
+                3 => 0x0058, // Serial
+                4 => 0x0060, // Joypad
+                _ => panic!("Invalid Interrupt {i}"),
+            };
+
+            break;
+        }
+    }
 
     fn update_timers(&mut self) {
-        self.io_registers[DIV_REGISTER - 0xff00] = (self.cpu_timer / 128) as u8; 
+        let t_cycles = self.instruction_m_cycle.wrapping_mul(4);
+
+        self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle);
+        self.div_counter = self.div_counter.wrapping_add(t_cycles);
+        self.io_registers[DIV_REGISTER - 0xff00] = (self.div_counter >> 8) as u8;
+
+        self.instruction_m_cycle = 0;
     }
 
     fn fde(&mut self) {
@@ -701,7 +741,7 @@ impl GameBoy {
                 }
                 if z == 3 && y == 7 {
                     // ei
-                    self.interrupt_master_enable = true;
+                    self.ei_executed = true;
                 }
             }
             _ => panic!("Invalid OP code {opcode}"),
@@ -998,7 +1038,7 @@ impl GameBoy {
             3 => self.get_register_e(),
             4 => self.get_register_h(),
             5 => self.get_register_l(),
-            6 => self.read_ram(self.hl), 
+            6 => self.read_ram(self.hl),
             7 => self.get_register_a(),
             _ => panic!("Trying to get r8 with {register}"),
         };
@@ -1195,11 +1235,11 @@ impl GameBoy {
 
     fn clear_interrupt(&mut self, idx: u8) {
         self.interrupt_enable = self.interrupt_enable & !(1 << idx);
-        let interrupt_flag = self.read_ram(INTERRUPT_FLAG);
-        self.write_ram(INTERRUPT_FLAG, interrupt_flag & !(1 << idx));
+        let interrupt_flag = self.io_registers[INTERRUPT_FLAG - 0xff00];
+        self.io_registers[INTERRUPT_FLAG - 0xff00] = interrupt_flag & !(1 << idx);
     }
 
-    fn increment_cpu_timer(&mut self, value: u32) {
-        self.cpu_timer = self.cpu_timer.wrapping_add(value);
+    fn increment_cpu_timer(&mut self, value: i16) {
+        self.instruction_m_cycle = self.instruction_m_cycle.wrapping_add(value);
     }
 }
