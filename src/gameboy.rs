@@ -3,16 +3,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::constants::{DIV_REGISTER, INTERRUPT_FLAG, VBK_ADDR, WRAM_BANK_SELECT};
+use raylib::{drawing::RaylibDraw, ffi::Color};
+
+use crate::constants::{
+    DIV_REGISTER, INTERRUPT_FLAG, TAC_REGISTER, TIMA_REGISTER, TMA_REGISTER, VBK_ADDR,
+    WRAM_BANK_SELECT,
+};
 
 #[derive(Debug)]
 pub struct GameBoy {
-    catrigde_rom: [u8; 512 * 1024],
-    catridge_ram: [u8; 32 * 1024],
-
-    catridge_selected_rom: u8,
-    catridge_selected_ram: u8,
-
     w_ram: [u8; 32 * 1024],  // Work RAM
     v_ram: [u8; 16 * 1024],  // Video RAM
     h_ram: [u8; 128],        // High RAM
@@ -32,23 +31,32 @@ pub struct GameBoy {
     ei_executed: bool,             // Flag to show whether EI instruction is called
     interrupt_enable: u8,          // Interrupt Enable
 
-    external_ram_enabled: bool,
-    
-    m_cycles: i16,
-    instruction_m_cycle: i16,
-    div_counter: i16,
+    // Timer
+    m_cycles: u16,
+    instruction_m_cycle: u16,
+    div_counter: u16,
+    tima_overflowed: bool,
+    tma_value: u8,
 
+    // Catridge
+    catrigde_rom: [u8; 512 * 1024],
+    catridge_ram: [u8; 32 * 1024],
+    catridge_selected_rom: u8,
+    catridge_selected_ram: u8,
+    external_ram_enabled: bool,
+
+    // HALT
     cpu_halted: bool,
 }
 
 impl GameBoy {
     pub fn new(rom: Vec<u8>) -> Self {
         let mut gb = GameBoy {
-            af: 0x01B0,
-            bc: 0x0013,
-            de: 0x00D8,
-            hl: 0x014D,
-            sp: 0xFFFE,
+            af: 0x0000,
+            bc: 0x0000,
+            de: 0x0000,
+            hl: 0x0000,
+            sp: 0x0000,
             pc: 0x1000,
 
             w_ram: [0; 32 * 1024],
@@ -66,10 +74,12 @@ impl GameBoy {
             interrupt_master_enable: false, // disabled when game starts running
             interrupt_enable: 0,
             ei_executed: false,
-            
+
             m_cycles: 0,
             instruction_m_cycle: 0,
             div_counter: 0,
+            tima_overflowed: false,
+            tma_value: 0,
 
             cpu_halted: false,
         };
@@ -168,9 +178,26 @@ impl GameBoy {
             0xff00..=0xff7f => {
                 // I/O Registers
                 if addr_usize == DIV_REGISTER {
-                    self.io_registers[addr_usize] = 0;
+                    self.io_registers[addr_usize - 0xff00] = 0;
                     self.div_counter = 0;
                 }
+
+                if addr_usize == TAC_REGISTER {
+                    let tima = self.io_registers[TIMA_REGISTER - 0xff00];
+                    let (sum, did_overflow) = tima.overflowing_add(1);
+
+                    if did_overflow {
+                        // self.tima_overflowed = true;
+                    }
+
+                    self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+                }
+
+                if addr_usize == TMA_REGISTER {
+                    self.tma_value = val;
+                    return;
+                }
+
                 self.io_registers[addr_usize - 0xff00] = val;
             }
             0xff80..=0xfffe => {
@@ -263,7 +290,12 @@ impl GameBoy {
     }
 
     pub fn main(&mut self) {
+        // let (mut rl, thread) = raylib::init().size(640, 480).title("Gameboy").build();
+
+        // while !rl.window_should_close() {
         loop {
+            // let mut d = rl.begin_drawing(&thread);
+
             if self.cpu_halted {
                 if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x0F > 1 {
                     self.cpu_halted = false;
@@ -273,8 +305,12 @@ impl GameBoy {
             if !self.cpu_halted {
                 self.handle_interrupt();
                 self.fde();
-                self.update_timers();
             }
+
+            self.update_timers();
+
+            self.io_registers[TMA_REGISTER - 0xff00] = self.tma_value;
+            self.instruction_m_cycle = 0;
         }
     }
 
@@ -291,18 +327,17 @@ impl GameBoy {
         }
 
         for i in 0..=4 {
-            if (self.interrupt_enable >> i) & (self.io_registers[INTERRUPT_FLAG - 0xff00] >> i) == 0
+            if (self.interrupt_enable >> i) & (self.io_registers[INTERRUPT_FLAG - 0xff00] >> i) & 1
+                == 0
             {
                 continue;
             }
 
             self.increment_cpu_timer(3);
-
             self.clear_interrupt(i);
-            self.interrupt_master_enable = false;
             self.push_to_stack(self.pc);
 
-            match i {
+            let addr = match i {
                 0 => 0x0040, // VBlank
                 1 => 0x0048, // LCD STAT
                 2 => 0x0050, // Timer
@@ -311,26 +346,60 @@ impl GameBoy {
                 _ => panic!("Invalid Interrupt {i}"),
             };
 
+            self.pc = addr;
+
             break;
         }
     }
 
     fn update_timers(&mut self) {
-        let t_cycles = self.instruction_m_cycle.wrapping_mul(4);
+        let t_cycles = self.instruction_m_cycle.wrapping_mul(4) as u16;
 
         self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle);
+
         self.div_counter = self.div_counter.wrapping_add(t_cycles);
         self.io_registers[DIV_REGISTER - 0xff00] = (self.div_counter >> 8) as u8;
 
-        self.instruction_m_cycle = 0;
+        let tac_register = self.io_registers[TAC_REGISTER - 0xff00];
+
+        if self.tima_overflowed {
+            self.io_registers[TIMA_REGISTER - 0xff00] = self.io_registers[TMA_REGISTER - 0xff00];
+            self.request_timer_interrupt();
+            self.tima_overflowed = false;
+        }
+
+        if (tac_register & 0b100) >> 2 == 0 {
+            return;
+        }
+
+        let speed = match tac_register & 0b11 {
+            0 => 256,
+            1 => 4,
+            2 => 16,
+            3 => 64,
+            _ => {
+                unreachable!("Error occurred while updating timers: TAC Register: {tac_register}")
+            }
+        };
+
+        // if  == 0 {
+        //     let timer_counter = self.io_registers[TIMA_REGISTER - 0xff00];
+        //     let (sum, did_overflow) = timer_counter.overflowing_add(1);
+
+        //     if did_overflow {
+        //         self.tima_overflowed = true;
+        //     } else {
+        //         self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+        //     }
+        // }
     }
 
     fn fde(&mut self) {
         let opcode = self.fetch_value_u8();
         let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
-        // println!("{opcode} {:x}", self.pc);
-        // thread::sleep(Duration::from_millis(1));
+        // println!("{:x} {:x}", opcode, self.pc);
+        // thread::sleep(Duration::from_nanos(10000));
 
         match x {
             0 => {
@@ -555,7 +624,6 @@ impl GameBoy {
                 if y == 6 && z == 6 {
                     // TODO: halt
                     self.cpu_halted = true;
-                    println!("Halted");
                 } else {
                     let val = self.get_r8(z);
                     self.set_r8(y, val);
@@ -747,6 +815,8 @@ impl GameBoy {
             _ => panic!("Invalid OP code {opcode}"),
         }
     }
+
+    fn draw(&mut self) {}
 
     fn check_condition(&mut self, y: u8) -> bool {
         let res = match y & !0b100 {
@@ -1193,53 +1263,25 @@ impl GameBoy {
         (self.af & 0x0040) > 0
     }
 
-    // fn is_vblank_interrupt_requested(&self) -> bool {
-    //     self.read_ram(INTERRUPT_FLAG) & 1 == 1
-    // }
-
-    // fn is_lcd_interrupt_requested(&self) -> bool {
-    //     (self.read_ram(INTERRUPT_FLAG) >> 1) & 1 == 1
-    // }
-
-    // fn is_timer_interrupt_requesis(&self) -> bool {
-    //     (self.read_ram(INTERRUPT_FLAG) >> 2) & 1 == 1
-    // }
-
-    // fn is_serial_interrupt_requested(&self) -> bool {
-    //     (self.read_ram(INTERRUPT_FLAG) >> 3) & 1 == 1
-    // }
-
-    // fn is_joypad_interrupt_requested(&self) -> bool {
-    //     (self.read_ram(INTERRUPT_FLAG) >> 4) & 1 == 1
-    // }
-
-    // fn is_vblank_interrupt_enabled(&self) -> bool {
-    //     self.interrupt_enable & 1 == 1
-    // }
-
-    // fn is_lcd_interrupt_enabled(&self) -> bool {
-    //     (self.interrupt_enable >> 1) & 1 == 1
-    // }
-
-    // fn is_timer_interrupt_enabled(&self) -> bool {
-    //     (self.interrupt_enable >> 2) & 1 == 1
-    // }
-
-    // fn is_serial_interrupt_enabled(&self) -> bool {
-    //     (self.interrupt_enable >> 3) & 1 == 1
-    // }
-
-    // fn is_joypad_interrupt_enabled(&self) -> bool {
-    //     (self.interrupt_enable >> 4) & 1 == 1
-    // }
-
-    fn clear_interrupt(&mut self, idx: u8) {
-        self.interrupt_enable = self.interrupt_enable & !(1 << idx);
-        let interrupt_flag = self.io_registers[INTERRUPT_FLAG - 0xff00];
-        self.io_registers[INTERRUPT_FLAG - 0xff00] = interrupt_flag & !(1 << idx);
+    fn request_timer_interrupt(&mut self) {
+        self.io_registers[INTERRUPT_FLAG - 0xff00] |= 1 << 2;
     }
 
-    fn increment_cpu_timer(&mut self, value: i16) {
+    fn get_scy(&mut self) -> &mut u8 {
+        return &mut self.io_registers[0xFF42 - 0xFF00];
+    }
+
+    fn get_scx(&mut self) -> &mut u8 {
+        return &mut self.io_registers[0xFF43 - 0xFF00];
+    }
+
+    fn clear_interrupt(&mut self, idx: u8) {
+        let interrupt_flag = self.io_registers[INTERRUPT_FLAG - 0xff00];
+        self.io_registers[INTERRUPT_FLAG - 0xff00] = interrupt_flag & !(1 << idx);
+        self.interrupt_master_enable = false;
+    }
+
+    fn increment_cpu_timer(&mut self, value: u16) {
         self.instruction_m_cycle = self.instruction_m_cycle.wrapping_add(value);
     }
 }
