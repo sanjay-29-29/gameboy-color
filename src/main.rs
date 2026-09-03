@@ -3,6 +3,7 @@ use std::fs;
 use crate::gameboy::GameBoy;
 
 mod constants;
+mod display;
 mod gameboy;
 
 fn main() {

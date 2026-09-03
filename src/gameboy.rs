@@ -3,12 +3,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use raylib::{drawing::RaylibDraw, ffi::Color};
-
-use crate::constants::{
-    DIV_REGISTER, INTERRUPT_FLAG, TAC_REGISTER, TIMA_REGISTER, TMA_REGISTER, VBK_ADDR,
-    WRAM_BANK_SELECT,
+use raylib::{
+    RaylibHandle,
+    drawing::{RaylibDraw, RaylibDrawHandle},
+    ffi::Color,
 };
+
+use crate::{constants::*, display::PPU};
+
+enum Interrupt {
+    VBlank,
+    LcdStat,
+    Timer,
+    Serial,
+    Joypad,
+}
 
 #[derive(Debug)]
 pub struct GameBoy {
@@ -37,6 +46,7 @@ pub struct GameBoy {
     div_counter: u16,
     tima_overflowed: bool,
     tma_value: u8,
+    tima_offset: u16,
 
     // Catridge
     catrigde_rom: [u8; 512 * 1024],
@@ -57,7 +67,7 @@ impl GameBoy {
             de: 0x0000,
             hl: 0x0000,
             sp: 0x0000,
-            pc: 0x1000,
+            pc: 0x0000,
 
             w_ram: [0; 32 * 1024],
             v_ram: [0; 16 * 1024],
@@ -80,6 +90,7 @@ impl GameBoy {
             div_counter: 0,
             tima_overflowed: false,
             tma_value: 0,
+            tima_offset: 0,
 
             cpu_halted: false,
         };
@@ -290,40 +301,44 @@ impl GameBoy {
     }
 
     pub fn main(&mut self) {
-        // let (mut rl, thread) = raylib::init().size(640, 480).title("Gameboy").build();
+        let (mut rl, thread) = raylib::init().size(160, 144).title("Gameboy").build();
 
-        // while !rl.window_should_close() {
-        loop {
-            // let mut d = rl.begin_drawing(&thread);
+        while !rl.window_should_close() {
+            // loop {
+            //let mut d = rl.begin_drawing(&thread);
 
             if self.cpu_halted {
-                if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x0F > 1 {
+                if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x1F > 0 {
                     self.cpu_halted = false;
                 }
+                self.increment_cpu_timer(1);
             }
 
             if !self.cpu_halted {
-                self.handle_interrupt();
-                self.fde();
+                if !self.handle_interrupt() {
+                    self.fde();
+                }
             }
 
             self.update_timers();
 
             self.io_registers[TMA_REGISTER - 0xff00] = self.tma_value;
             self.instruction_m_cycle = 0;
+
+            self.draw();
         }
     }
 
-    pub fn handle_interrupt(&mut self) {
+    pub fn handle_interrupt(&mut self) -> bool {
         if self.ei_executed {
             // The effect of ei is delayed by one instruction
             self.ei_executed = false;
             self.interrupt_master_enable = true;
-            return;
+            return false;
         }
 
         if !self.interrupt_master_enable {
-            return;
+            return false;
         }
 
         for i in 0..=4 {
@@ -348,8 +363,10 @@ impl GameBoy {
 
             self.pc = addr;
 
-            break;
+            return true;
         }
+
+        false
     }
 
     fn update_timers(&mut self) {
@@ -364,9 +381,11 @@ impl GameBoy {
 
         if self.tima_overflowed {
             self.io_registers[TIMA_REGISTER - 0xff00] = self.io_registers[TMA_REGISTER - 0xff00];
-            self.request_timer_interrupt();
+            self.request_interrupt(Interrupt::Timer);
             self.tima_overflowed = false;
         }
+
+        self.tima_offset = self.tima_offset.wrapping_add(self.instruction_m_cycle);
 
         if (tac_register & 0b100) >> 2 == 0 {
             return;
@@ -382,16 +401,17 @@ impl GameBoy {
             }
         };
 
-        // if  == 0 {
-        //     let timer_counter = self.io_registers[TIMA_REGISTER - 0xff00];
-        //     let (sum, did_overflow) = timer_counter.overflowing_add(1);
+        while self.tima_offset >= speed {
+            self.tima_offset -= speed;
+            let timer_counter = self.io_registers[TIMA_REGISTER - 0xff00];
+            let (sum, did_overflow) = timer_counter.overflowing_add(1);
 
-        //     if did_overflow {
-        //         self.tima_overflowed = true;
-        //     } else {
-        //         self.io_registers[TIMA_REGISTER - 0xff00] = sum;
-        //     }
-        // }
+            if did_overflow {
+                self.tima_overflowed = true;
+            }
+
+            self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+        }
     }
 
     fn fde(&mut self) {
@@ -430,7 +450,7 @@ impl GameBoy {
                 if z == 1 && (y & 0b001) == 0 {
                     // ld r16, imm16
                     let val = self.fetch_value_u16();
-                    let register = self.get_r16(y);
+                    let register = self.get_r16_mut(y);
 
                     *register = val;
                 }
@@ -458,7 +478,7 @@ impl GameBoy {
                 }
                 if z == 3 && (y & 0b001) == 0 {
                     // inc r16
-                    let register = self.get_r16(y);
+                    let register = self.get_r16_mut(y);
                     let sum = (*register).wrapping_add(1);
 
                     *register = sum;
@@ -467,7 +487,7 @@ impl GameBoy {
                 }
                 if z == 3 && (y & 0b001) == 1 {
                     // dec r16
-                    let register = self.get_r16(y);
+                    let register = self.get_r16_mut(y);
                     let sum = (*register).wrapping_sub(1);
 
                     *register = sum;
@@ -476,7 +496,7 @@ impl GameBoy {
                 }
                 if z == 1 && (y & 0b001) == 1 {
                     // add hl, r16
-                    let register_val = *self.get_r16(y);
+                    let register_val = *self.get_r16_mut(y);
                     let (sum, did_carry) = self.hl.overflowing_add(register_val);
 
                     self.set_subtraction_flag(false);
@@ -708,13 +728,13 @@ impl GameBoy {
                         // force the bottom 4 bits to 0
                         self.af = val & 0xFFF0;
                     } else {
-                        let register = self.get_r16stk(y);
+                        let register = self.get_r16stk_mut(y);
                         *register = val;
                     }
                 }
                 if z == 5 && (y & 0b001) == 0 {
                     // push r16stk
-                    let mut register = *self.get_r16stk(y);
+                    let mut register = *self.get_r16stk_mut(y);
 
                     if y == 6 {
                         register &= 0xFFF0;
@@ -815,8 +835,6 @@ impl GameBoy {
             _ => panic!("Invalid OP code {opcode}"),
         }
     }
-
-    fn draw(&mut self) {}
 
     fn check_condition(&mut self, y: u8) -> bool {
         let res = match y & !0b100 {
@@ -927,8 +945,6 @@ impl GameBoy {
             }
             1 => {
                 // bit b3, r8
-                let register = self.get_r8(z);
-
                 self.set_zero_flag(!((register >> y) & 1 == 1));
                 self.set_subtraction_flag(false);
                 self.set_half_carry_flag(true);
@@ -1044,7 +1060,7 @@ impl GameBoy {
         self.set_zero_flag(res == 0);
     }
 
-    fn get_r16(&mut self, y: u8) -> &mut u16 {
+    fn get_r16_mut(&mut self, y: u8) -> &mut u16 {
         let res = match y >> 1 {
             0x0 => &mut self.bc,
             0x1 => &mut self.de,
@@ -1056,7 +1072,7 @@ impl GameBoy {
         res
     }
 
-    fn get_r16stk(&mut self, y: u8) -> &mut u16 {
+    fn get_r16stk_mut(&mut self, y: u8) -> &mut u16 {
         let res = match y >> 1 {
             0x0 => &mut self.bc,
             0x1 => &mut self.de,
@@ -1263,16 +1279,25 @@ impl GameBoy {
         (self.af & 0x0040) > 0
     }
 
-    fn request_timer_interrupt(&mut self) {
-        self.io_registers[INTERRUPT_FLAG - 0xff00] |= 1 << 2;
-    }
-
-    fn get_scy(&mut self) -> &mut u8 {
+    fn get_scy_mut(&mut self) -> &mut u8 {
         return &mut self.io_registers[0xFF42 - 0xFF00];
     }
 
-    fn get_scx(&mut self) -> &mut u8 {
+    fn get_scx_mut(&mut self) -> &mut u8 {
         return &mut self.io_registers[0xFF43 - 0xFF00];
+    }
+
+    fn request_interrupt(&mut self, interrupt: Interrupt) {
+        let bit = match interrupt {
+            Interrupt::VBlank => 0,
+            Interrupt::LcdStat => 1,
+            Interrupt::Timer => 2,
+            Interrupt::Serial => 3,
+            Interrupt::Joypad => 4,
+        };
+
+        self.io_registers[INTERRUPT_FLAG - 0xff00] =
+            self.io_registers[INTERRUPT_FLAG - 0xff00] | (1 << bit);
     }
 
     fn clear_interrupt(&mut self, idx: u8) {
@@ -1284,4 +1309,18 @@ impl GameBoy {
     fn increment_cpu_timer(&mut self, value: u16) {
         self.instruction_m_cycle = self.instruction_m_cycle.wrapping_add(value);
     }
+
+    // fn draw(
+    //     &mut self,
+    //     //rl: &mut RaylibHandle
+    // ) {
+    //     // d.clear_background(Color::WHITE);
+    //     //
+    //     for i in 0x9800..=0x9900 {
+    //         let val = self.read_ram(i);
+    //         if val != 0 {
+    //             println!("{}", val);
+    //         }
+    //     }
+    // }
 }
