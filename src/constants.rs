@@ -17,9 +17,12 @@ pub const INTERRUPT_FLAG: usize = 0xFF0F;
 
 pub const WINDOW_X: usize = 0xFF4A;
 pub const WINDOW_Y: usize = 0xFF4B;
+
 pub const LCDC: usize = 0xFF40; // LCD Control
 pub const LY: usize = 0xFF44; // LCD Y coordinate [read-only]
 pub const LYC: usize = 0xFF45; // LY compare
 pub const STAT: usize = 0xFF41; // LCD status
 pub const SCY: usize = 0xFF42; // Scroll Y
 pub const SCX: usize = 0xFF43; // Scroll X
+pub const SPD: usize = 0xFF4D; // Prepare speed switch
+pub const DMA: usize = 0xFF46; // OAM DMA source address & start

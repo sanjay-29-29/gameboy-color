@@ -9,7 +9,7 @@ use raylib::{
     ffi::Color,
 };
 
-use crate::{constants::*, display::PPU};
+use crate::constants::*;
 
 enum Interrupt {
     VBlank,
@@ -17,6 +17,17 @@ enum Interrupt {
     Timer,
     Serial,
     Joypad,
+}
+
+enum LCDControlRegister {
+    PPUEnable,
+    WindowTileMap,
+    WindowEnable,
+    BGTileMap,
+    BGWindowTileArea,
+    ObjSize,
+    ObjEnable,
+    Priority,
 }
 
 #[derive(Debug)]
@@ -49,18 +60,20 @@ pub struct GameBoy {
     tima_offset: u16,
 
     // Catridge
-    catrigde_rom: [u8; 512 * 1024],
-    catridge_ram: [u8; 32 * 1024],
+    catrigde_rom: [u8; 1024 * 1024],
+    catridge_ram: [u8; 1024 * 1024],
     catridge_selected_rom: u8,
     catridge_selected_ram: u8,
     external_ram_enabled: bool,
 
     // HALT
     cpu_halted: bool,
+
+    double_speed_mode: bool,
 }
 
 impl GameBoy {
-    pub fn new(rom: Vec<u8>) -> Self {
+    pub fn new(boot_rom: Vec<u8>, rom: Vec<u8>) -> Self {
         let mut gb = GameBoy {
             af: 0x0000,
             bc: 0x0000,
@@ -75,8 +88,8 @@ impl GameBoy {
             oam: [0; 160],
             io_registers: [0; 128],
 
-            catrigde_rom: [0; 512 * 1024],
-            catridge_ram: [0; 32 * 1024],
+            catrigde_rom: [0; 1024 * 1024],
+            catridge_ram: [0; 1024 * 1024],
             external_ram_enabled: false,
             catridge_selected_rom: 1,
             catridge_selected_ram: 0,
@@ -93,17 +106,30 @@ impl GameBoy {
             tima_offset: 0,
 
             cpu_halted: false,
+            double_speed_mode: false,
         };
-
-        gb.load_rom(rom);
+        gb.load_rom(boot_rom, rom);
+        gb.reset();
 
         gb
     }
 
-    fn load_rom(&mut self, rom: Vec<u8>) {
+    fn load_rom(&mut self, boot_rom: Vec<u8>, rom: Vec<u8>) {
         for i in 0..rom.len() {
             self.catrigde_rom[i] = rom[i];
         }
+        for i in 0..boot_rom.len() {
+            self.catrigde_rom[i] = boot_rom[i];
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pc = 0x0000;
+        self.af = 0x0000;
+        self.bc = 0x0000;
+        self.de = 0x0000;
+        self.hl = 0x0000;
+        self.sp = 0x0000;
     }
 
     fn write_ram(&mut self, addr: u16, val: u8) {
@@ -188,28 +214,36 @@ impl GameBoy {
             // }
             0xff00..=0xff7f => {
                 // I/O Registers
-                if addr_usize == DIV_REGISTER {
-                    self.io_registers[addr_usize - 0xff00] = 0;
-                    self.div_counter = 0;
-                }
 
-                if addr_usize == TAC_REGISTER {
-                    let tima = self.io_registers[TIMA_REGISTER - 0xff00];
-                    let (sum, did_overflow) = tima.overflowing_add(1);
-
-                    if did_overflow {
-                        // self.tima_overflowed = true;
+                match addr_usize {
+                    DIV_REGISTER => {
+                        self.io_registers[addr_usize - 0xff00] = 0;
+                        self.div_counter = 0;
                     }
+                    TAC_REGISTER => {
+                        let tima = self.io_registers[TIMA_REGISTER - 0xff00];
+                        let (sum, did_overflow) = tima.overflowing_add(1);
 
-                    self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+                        if did_overflow {
+                            self.tima_overflowed = true;
+                        }
+
+                        self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+                        self.io_registers[TAC_REGISTER - 0xff00] = val
+                    }
+                    TMA_REGISTER => {
+                        self.tma_value = val;
+                    }
+                    DMA => {
+                        let (start_addr, end_addr): (usize, usize) =
+                            ((val as usize) << 4, 0x9F | (val as usize) << 4);
+
+                        for addr in start_addr..=end_addr {
+                            self.oam[addr - start_addr] = self.read_ram(addr as u16);
+                        }
+                    }
+                    _ => self.io_registers[addr_usize - 0xff00] = val,
                 }
-
-                if addr_usize == TMA_REGISTER {
-                    self.tma_value = val;
-                    return;
-                }
-
-                self.io_registers[addr_usize - 0xff00] = val;
             }
             0xff80..=0xfffe => {
                 // High RAM (HRAM)
@@ -246,6 +280,8 @@ impl GameBoy {
                 if self.io_registers[VBK_ADDR - 0xff00] & 1 == 1 {
                     base_addr = 0x2000;
                 }
+
+                // println!("{}", self.io_registers[VBK_ADDR - 0xff00]);
 
                 return self.v_ram[base_addr + (addr_usize - 0x8000)];
             }
@@ -284,7 +320,6 @@ impl GameBoy {
             // }
             0xff00..=0xff7f => {
                 // I/O Registers
-                if addr_usize == DIV_REGISTER {}
                 return self.io_registers[addr_usize - 0xff00];
             }
             0xff80..=0xfffe => {
@@ -305,7 +340,7 @@ impl GameBoy {
 
         while !rl.window_should_close() {
             // loop {
-            //let mut d = rl.begin_drawing(&thread);
+            let mut d = rl.begin_drawing(&thread);
 
             if self.cpu_halted {
                 if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x1F > 0 {
@@ -325,7 +360,7 @@ impl GameBoy {
             self.io_registers[TMA_REGISTER - 0xff00] = self.tma_value;
             self.instruction_m_cycle = 0;
 
-            self.draw();
+            self.draw(&mut d);
         }
     }
 
@@ -370,14 +405,12 @@ impl GameBoy {
     }
 
     fn update_timers(&mut self) {
-        let t_cycles = self.instruction_m_cycle.wrapping_mul(4) as u16;
+        let t_cycles = self.instruction_m_cycle * 4;
 
         self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle);
 
         self.div_counter = self.div_counter.wrapping_add(t_cycles);
         self.io_registers[DIV_REGISTER - 0xff00] = (self.div_counter >> 8) as u8;
-
-        let tac_register = self.io_registers[TAC_REGISTER - 0xff00];
 
         if self.tima_overflowed {
             self.io_registers[TIMA_REGISTER - 0xff00] = self.io_registers[TMA_REGISTER - 0xff00];
@@ -386,6 +419,8 @@ impl GameBoy {
         }
 
         self.tima_offset = self.tima_offset.wrapping_add(self.instruction_m_cycle);
+
+        let tac_register = self.io_registers[TAC_REGISTER - 0xff00];
 
         if (tac_register & 0b100) >> 2 == 0 {
             return;
@@ -402,7 +437,6 @@ impl GameBoy {
         };
 
         while self.tima_offset >= speed {
-            self.tima_offset -= speed;
             let timer_counter = self.io_registers[TIMA_REGISTER - 0xff00];
             let (sum, did_overflow) = timer_counter.overflowing_add(1);
 
@@ -411,6 +445,7 @@ impl GameBoy {
             }
 
             self.io_registers[TIMA_REGISTER - 0xff00] = sum;
+            self.tima_offset -= speed;
         }
     }
 
@@ -418,8 +453,8 @@ impl GameBoy {
         let opcode = self.fetch_value_u8();
         let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
-        // println!("{:x} {:x}", opcode, self.pc);
-        // thread::sleep(Duration::from_nanos(10000));
+        println!("{:x} {:x}", opcode, self.pc);
+        thread::sleep(Duration::from_millis(10));
 
         match x {
             0 => {
@@ -1310,17 +1345,43 @@ impl GameBoy {
         self.instruction_m_cycle = self.instruction_m_cycle.wrapping_add(value);
     }
 
-    // fn draw(
-    //     &mut self,
-    //     //rl: &mut RaylibHandle
-    // ) {
-    //     // d.clear_background(Color::WHITE);
-    //     //
-    //     for i in 0x9800..=0x9900 {
-    //         let val = self.read_ram(i);
-    //         if val != 0 {
-    //             println!("{}", val);
-    //         }
-    //     }
-    // }
+    fn get_speed_reg_mut(&mut self) -> &mut u8 {
+        &mut self.io_registers[SPD - 0xFF00]
+    }
+
+    fn read_vram(&self, addr: u16) -> u8 {
+        return self.v_ram[addr as usize];
+    }
+
+    fn get_lcd_control_register(&self, register: LCDControlRegister) -> bool {
+        let register_val = self.io_registers[LCDC_REGISTER - 0xFF00];
+
+        let val = match register {
+            LCDControlRegister::PPUEnable => register_val >> 7,
+            LCDControlRegister::WindowTileMap => register_val >> 6,
+            LCDControlRegister::WindowEnable => register_val >> 5,
+            LCDControlRegister::BGWindowTileArea => register_val >> 4,
+            LCDControlRegister::BGTileMap => register_val >> 3,
+            LCDControlRegister::ObjSize => register_val >> 2,
+            LCDControlRegister::ObjEnable => register_val >> 1,
+            LCDControlRegister::Priority => register_val,
+        };
+
+        val & 1 == 1
+    }
+
+    fn draw(&mut self, d: &mut RaylibDrawHandle) {
+        // d.clear_background(Color::WHITE);
+
+        // for i in 0..20 {
+        //     for j in 0..18 {
+        //         let a = self.read_ram();
+        //         let b = self.read_ram(addr);
+
+        //         for x in 0..8 {
+        //             d.draw_pixel(, , );
+        //         }
+        //     }
+        // }
+    }
 }
