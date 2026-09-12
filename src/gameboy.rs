@@ -1,13 +1,4 @@
-use std::{
-    io, thread,
-    time::{Duration, Instant},
-};
-
-use raylib::{
-    RaylibHandle,
-    drawing::{RaylibDraw, RaylibDrawHandle},
-    ffi::Color,
-};
+use raylib::{RaylibHandle, RaylibThread, drawing::RaylibDraw, ffi::Color};
 
 use crate::constants::*;
 
@@ -52,7 +43,7 @@ pub struct GameBoy {
     interrupt_enable: u8,          // Interrupt Enable
 
     // Timer
-    m_cycles: u16,
+    m_cycles: u64,
     instruction_m_cycle: u16,
     div_counter: u16,
     tima_overflowed: bool,
@@ -62,14 +53,20 @@ pub struct GameBoy {
     // Catridge
     catrigde_rom: [u8; 1024 * 1024],
     catridge_ram: [u8; 1024 * 1024],
+    boot_rom: [u8; 256],
     catridge_selected_rom: u8,
     catridge_selected_ram: u8,
     external_ram_enabled: bool,
+    boot_rom_disabled: bool,
 
     // HALT
     cpu_halted: bool,
-
     double_speed_mode: bool,
+
+    // PPU
+    is_vblank: bool,
+    ppu_timer: u32,
+    framebuffer: [u8; 23040],
 }
 
 impl GameBoy {
@@ -90,9 +87,11 @@ impl GameBoy {
 
             catrigde_rom: [0; 1024 * 1024],
             catridge_ram: [0; 1024 * 1024],
+            boot_rom: [0; 256],
             external_ram_enabled: false,
             catridge_selected_rom: 1,
             catridge_selected_ram: 0,
+            boot_rom_disabled: false,
 
             interrupt_master_enable: false, // disabled when game starts running
             interrupt_enable: 0,
@@ -107,7 +106,12 @@ impl GameBoy {
 
             cpu_halted: false,
             double_speed_mode: false,
+
+            is_vblank: false,
+            ppu_timer: 0,
+            framebuffer: [0; 23040],
         };
+
         gb.load_rom(boot_rom, rom);
         gb.reset();
 
@@ -118,18 +122,19 @@ impl GameBoy {
         for i in 0..rom.len() {
             self.catrigde_rom[i] = rom[i];
         }
+
         for i in 0..boot_rom.len() {
-            self.catrigde_rom[i] = boot_rom[i];
+            self.boot_rom[i] = boot_rom[i];
         }
     }
 
     fn reset(&mut self) {
-        self.pc = 0x0000;
-        self.af = 0x0000;
-        self.bc = 0x0000;
-        self.de = 0x0000;
-        self.hl = 0x0000;
-        self.sp = 0x0000;
+        self.pc = 0;
+        self.af = 0;
+        self.bc = 0;
+        self.de = 0;
+        self.hl = 0;
+        self.sp = 0;
     }
 
     fn write_ram(&mut self, addr: u16, val: u8) {
@@ -146,7 +151,12 @@ impl GameBoy {
         }
 
         match addr {
-            0x0000..=0x1fff => {
+            0x0000..=0x00ff => {
+                if val & 0x0F == 0x0A && self.boot_rom_disabled {
+                    self.external_ram_enabled = true;
+                }
+            }
+            0x0100..=0x1fff => {
                 // external RAM enabled by writing $A
                 if val & 0x0F == 0x0A {
                     self.external_ram_enabled = true;
@@ -209,9 +219,9 @@ impl GameBoy {
                 // Object attribute memory (OAM)
                 self.oam[addr_usize - 0xfe00] = val;
             }
-            // 0xfea0..=0xfeff => {
-            //     // return 0xFF;
-            // }
+            0xfea0..=0xfeff => {
+                // return 0xFF;
+            }
             0xff00..=0xff7f => {
                 // I/O Registers
 
@@ -242,6 +252,9 @@ impl GameBoy {
                             self.oam[addr - start_addr] = self.read_ram(addr as u16);
                         }
                     }
+                    BANK_REGISTER => {
+                        self.boot_rom_disabled = true;
+                    }
                     _ => self.io_registers[addr_usize - 0xff00] = val,
                 }
             }
@@ -252,9 +265,6 @@ impl GameBoy {
             0xffff => {
                 self.interrupt_enable = val;
             }
-            _ => {
-                self.catrigde_rom[addr_usize] = val;
-            }
         }
     }
 
@@ -264,7 +274,14 @@ impl GameBoy {
         let addr_usize = addr as usize;
 
         match addr {
-            0x0000..=0x3fff => {
+            0x0000..=0x00ff => {
+                if !self.boot_rom_disabled {
+                    return self.boot_rom[addr_usize];
+                } else {
+                    return self.catrigde_rom[addr_usize];
+                }
+            }
+            0x0100..=0x3fff => {
                 // 16 KiB ROM bank 00
                 return self.catrigde_rom[addr_usize];
             }
@@ -315,9 +332,9 @@ impl GameBoy {
                 // Object attribute memory (OAM)
                 return self.oam[addr_usize - 0xfe00];
             }
-            // 0xfea0..=0xfeff => {
-            //     return 0xFF;
-            // }
+            0xfea0..=0xfeff => {
+                return 0xFF;
+            }
             0xff00..=0xff7f => {
                 // I/O Registers
                 return self.io_registers[addr_usize - 0xff00];
@@ -329,19 +346,13 @@ impl GameBoy {
             0xffff => {
                 return self.interrupt_enable;
             }
-            _ => {
-                return self.catrigde_rom[addr_usize];
-            }
         }
     }
 
     pub fn main(&mut self) {
-        let (mut rl, thread) = raylib::init().size(160, 144).title("Gameboy").build();
+        let (mut rl, thread) = raylib::init().size(380, 288).title("Gameboy").build();
 
         while !rl.window_should_close() {
-            // loop {
-            let mut d = rl.begin_drawing(&thread);
-
             if self.cpu_halted {
                 if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x1F > 0 {
                     self.cpu_halted = false;
@@ -360,7 +371,7 @@ impl GameBoy {
             self.io_registers[TMA_REGISTER - 0xff00] = self.tma_value;
             self.instruction_m_cycle = 0;
 
-            self.draw(&mut d);
+            self.ppu(&mut rl, &thread);
         }
     }
 
@@ -407,7 +418,10 @@ impl GameBoy {
     fn update_timers(&mut self) {
         let t_cycles = self.instruction_m_cycle * 4;
 
-        self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle);
+        self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle as u64);
+        self.ppu_timer = self
+            .ppu_timer
+            .wrapping_add(self.instruction_m_cycle as u32 * 4);
 
         self.div_counter = self.div_counter.wrapping_add(t_cycles);
         self.io_registers[DIV_REGISTER - 0xff00] = (self.div_counter >> 8) as u8;
@@ -453,8 +467,8 @@ impl GameBoy {
         let opcode = self.fetch_value_u8();
         let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
-        println!("{:x} {:x}", opcode, self.pc);
-        thread::sleep(Duration::from_millis(10));
+        // println!("{:x} {:x}", opcode, self.pc);
+        // thread::sleep(Duration::from_millis(1));
 
         match x {
             0 => {
@@ -464,6 +478,7 @@ impl GameBoy {
                     }
                     if y == 2 {
                         // TODO: stop
+                        println!("Stop executed.");
                     }
                     if y == 3 {
                         // jr imm8
@@ -1350,7 +1365,13 @@ impl GameBoy {
     }
 
     fn read_vram(&self, addr: u16) -> u8 {
-        return self.v_ram[addr as usize];
+        let mut base_addr: usize = 0;
+
+        if self.io_registers[VBK_ADDR - 0xff00] & 1 == 1 {
+            base_addr = 0x2000;
+        }
+
+        return self.v_ram[base_addr + (addr as usize - 0x8000)];
     }
 
     fn get_lcd_control_register(&self, register: LCDControlRegister) -> bool {
@@ -1370,18 +1391,91 @@ impl GameBoy {
         val & 1 == 1
     }
 
-    fn draw(&mut self, d: &mut RaylibDrawHandle) {
-        // d.clear_background(Color::WHITE);
+    fn get_lc_reg_mut(&mut self) -> &mut u8 {
+        return &mut self.io_registers[LY - 0xFF00];
+    }
 
-        // for i in 0..20 {
-        //     for j in 0..18 {
-        //         let a = self.read_ram();
-        //         let b = self.read_ram(addr);
+    fn ppu(&mut self, rl: &mut RaylibHandle, thread: &RaylibThread) {
+        let screen_y = *self.get_lc_reg_mut() as u16;
 
-        //         for x in 0..8 {
-        //             d.draw_pixel(, , );
-        //         }
-        //     }
-        // }
+        if self.ppu_timer < 456 {
+            return;
+        }
+
+        let ly = self.get_lc_reg_mut();
+        *ly = (*ly + 1) % 154;
+
+        self.ppu_timer -= 456;
+
+        if screen_y == 143 {
+            self.request_interrupt(Interrupt::VBlank);
+        }
+
+        let mut d = rl.begin_drawing(&thread);
+
+        for screen_x in 0..160_u16 {
+            let (scx, scy) = (*self.get_scx_mut(), *self.get_scy_mut());
+
+            let tile_map_base_addr =
+                match self.get_lcd_control_register(LCDControlRegister::BGTileMap) {
+                    false => 0x9800,
+                    true => 0x9C00,
+                };
+
+            let a = (scx as u16 + screen_x) % 256;
+            let b = (scy as u16 + screen_y) % 256;
+
+            let tile_map = self.read_vram(tile_map_base_addr + (b / 8) * 32 + (a / 8));
+
+            let tile_data_addr: usize =
+                match self.get_lcd_control_register(LCDControlRegister::BGWindowTileArea) {
+                    true => 0x8000 + (tile_map as usize * 16),
+                    false => (0x9000 + (tile_map as i8 as i32 * 16)) as usize,
+                };
+
+            let (tile_row, tile_col) = (screen_y % 8, screen_x % 8);
+
+            let byte1 = self.read_vram(tile_data_addr as u16 + tile_row * 2);
+            let byte2 = self.read_vram(tile_data_addr as u16 + (tile_row * 2) + 1);
+
+            let color_value = ((byte2 >> (7 - tile_col)) & 1) << 1 | (byte1 >> (7 - tile_col)) & 1;
+
+            match color_value {
+                0 => d.draw_rectangle(screen_x as i32 * 2, screen_y as i32 * 2, 2, 2, Color::WHITE),
+                1 => d.draw_rectangle(
+                    screen_x as i32 * 2,
+                    screen_y as i32 * 2,
+                    2,
+                    2,
+                    Color::LIGHTGRAY,
+                ),
+                2 => d.draw_rectangle(screen_x as i32 * 2, screen_y as i32 * 2, 2, 2, Color::GRAY),
+                3 => d.draw_rectangle(screen_x as i32 * 2, screen_y as i32 * 2, 2, 2, Color::BLACK),
+                _ => unreachable!("{color_value}"),
+            }
+        }
+
+        for object_idx in 0..40 {
+            let (y_pos, x_pos, tile_idx, flags) = (
+                self.oam[object_idx + 0],
+                self.oam[object_idx + 1],
+                self.oam[object_idx + 2],
+                self.oam[object_idx + 3],
+            );
+
+            if let y_start = y_pos < 0 {
+                y_pos
+            } else {
+                y_pos
+            };
+
+            if let x_start = x_pos < 0 {
+                x_pos
+            } else {
+                x_pos
+            };
+
+            let tile_data_addr = self.read_vram(0x8000 + tile_idx as u16 * 16);
+        }
     }
 }
