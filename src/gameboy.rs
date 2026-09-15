@@ -1,6 +1,26 @@
-use raylib::{RaylibHandle, RaylibThread, drawing::RaylibDraw, ffi::Color};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
-use crate::constants::*;
+use raylib::{
+    RaylibHandle, RaylibThread,
+    drawing::RaylibDraw,
+    ffi::{Color, KeyboardKey},
+};
+
+use crate::{
+    constants::*,
+    gameboy::LCDState::{Mode2, Mode3},
+};
+
+#[derive(Debug, PartialEq)]
+enum LCDState {
+    Mode0,
+    Mode1,
+    Mode2,
+    Mode3,
+}
 
 enum Interrupt {
     VBlank,
@@ -67,6 +87,10 @@ pub struct GameBoy {
     is_vblank: bool,
     ppu_timer: u32,
     framebuffer: [u8; 23040],
+    lcdstate: LCDState,
+
+    //Joypad
+    joypad: u8,
 }
 
 impl GameBoy {
@@ -110,6 +134,9 @@ impl GameBoy {
             is_vblank: false,
             ppu_timer: 0,
             framebuffer: [0; 23040],
+            lcdstate: LCDState::Mode2,
+
+            joypad: 0,
         };
 
         gb.load_rom(boot_rom, rom);
@@ -336,7 +363,23 @@ impl GameBoy {
                 return 0xFF;
             }
             0xff00..=0xff7f => {
-                // I/O Registers
+                if addr_usize == JOYPAD {
+                    match (self.io_registers[0] >> 4) & 0b11 {
+                        0b00 => {}
+                        0b01 => {
+                            self.io_registers[0] |= !(self.joypad >> 4) & 0x0F;
+                        }
+                        0b10 => {
+                            self.io_registers[0] |= !(self.joypad & 0x0F) & 0x0F;
+                        }
+                        0b11 => {
+                            self.io_registers[0] |= 0x0F;
+                        }
+                        _ => {
+                            unreachable!("")
+                        }
+                    }
+                }
                 return self.io_registers[addr_usize - 0xff00];
             }
             0xff80..=0xfffe => {
@@ -352,6 +395,10 @@ impl GameBoy {
     pub fn main(&mut self) {
         let (mut rl, thread) = raylib::init().size(380, 288).title("Gameboy").build();
 
+        let cpu_time = Duration::from_secs_f64(1.0 / 4096.0);
+
+        let mut cpu = Instant::now();
+
         while !rl.window_should_close() {
             if self.cpu_halted {
                 if self.io_registers[INTERRUPT_FLAG - 0xff00] & self.interrupt_enable & 0x1F > 0 {
@@ -360,18 +407,58 @@ impl GameBoy {
                 self.increment_cpu_timer(1);
             }
 
-            if !self.cpu_halted {
-                if !self.handle_interrupt() {
-                    self.fde();
-                }
+            if !self.cpu_halted && !self.handle_interrupt() {
+                self.fde();
             }
 
             self.update_timers();
 
+            self.ppu(&mut rl, &thread);
+
+            self.handle_input(&mut rl);
+
             self.io_registers[TMA_REGISTER - 0xff00] = self.tma_value;
             self.instruction_m_cycle = 0;
 
-            self.ppu(&mut rl, &thread);
+            if self.m_cycles >= 256 {
+                let cpu_elapsed = cpu.elapsed();
+
+                if cpu_time > cpu_elapsed {
+                    thread::sleep(cpu_time - cpu_elapsed);
+                }
+
+                cpu = Instant::now();
+                self.m_cycles -= 256;
+            }
+        }
+    }
+
+    pub fn handle_input(&mut self, rl: &mut RaylibHandle) {
+        self.joypad = 0;
+
+        if rl.is_key_down(KeyboardKey::KEY_W) {
+            self.joypad = self.joypad | 1 << 2;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_A) {
+            self.joypad = self.joypad | 1 << 1;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_S) {
+            self.joypad = self.joypad | 1;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_D) {
+            self.joypad = self.joypad | 1 << 3;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_ENTER) {
+            self.joypad = self.joypad | 1 << 6;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT) {
+            self.joypad = self.joypad | 1 << 7;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_J) {
+            self.joypad = self.joypad | 1 << 5;
+        }
+        if rl.is_key_down(KeyboardKey::KEY_K) {
+            self.joypad = self.joypad | 1 << 4;
         }
     }
 
@@ -1391,27 +1478,79 @@ impl GameBoy {
         val & 1 == 1
     }
 
+    fn get_stat_reg_mut(&mut self) -> &mut u8 {
+        return &mut self.io_registers[STAT - 0xFF00];
+    }
+
     fn get_lc_reg_mut(&mut self) -> &mut u8 {
         return &mut self.io_registers[LY - 0xFF00];
     }
 
     fn ppu(&mut self, rl: &mut RaylibHandle, thread: &RaylibThread) {
-        let screen_y = *self.get_lc_reg_mut() as u16;
+        // println!("{:?}", self.lcdstate);
 
-        if self.ppu_timer < 456 {
-            return;
+        match self.lcdstate {
+            LCDState::Mode1 => {
+                if self.ppu_timer > 456 {
+                    let sy = self.get_lc_reg_mut();
+                    *sy = (*sy + 1) % 154;
+
+                    if *sy == 0 {
+                        self.lcdstate = LCDState::Mode2;
+                    }
+
+                    self.ppu_timer -= 456;
+                }
+            }
+            LCDState::Mode2 => {
+                let screen_y = *self.get_lc_reg_mut() as u16;
+
+                if screen_y == 144 {
+                    self.request_interrupt(Interrupt::VBlank);
+                    self.lcdstate = LCDState::Mode1;
+                } else if self.ppu_timer > 80 {
+                    self.ppu_timer -= 80;
+                    self.lcdstate = LCDState::Mode3;
+                }
+            }
+            LCDState::Mode0 => {
+                if self.ppu_timer > 204 {
+                    self.ppu_timer -= 204;
+                    self.lcdstate = LCDState::Mode2;
+                    let sy = self.get_lc_reg_mut();
+                    *sy = (*sy + 1) % 154;
+                }
+            }
+            LCDState::Mode3 => {
+                if self.ppu_timer < 172 {
+                    return;
+                }
+
+                self.draw(rl, thread);
+
+                self.ppu_timer -= 172;
+                self.lcdstate = LCDState::Mode0;
+            }
         }
 
-        let ly = self.get_lc_reg_mut();
-        *ly = (*ly + 1) % 154;
+        // if self.ppu_timer > 0 && self.lcdstate == LCDState::Mode2 {
+        //     let stat_mut = self.get_stat_reg_mut();
+        //     *stat_mut |= 1 << 5;
+        //     // self.request_interrupt(Interrupt::LcdStat);
+        //     self.lcdstate = LCDState::Mode0;
+        // }
 
-        self.ppu_timer -= 456;
+        // if self.ppu_timer > 252 && self.lcdstate == LCDState::Mode0 {
+        //     let stat_mut = self.get_stat_reg_mut();
+        //     *stat_mut |= 1 << 3;
+        //     // self.request_interrupt(Interrupt::LcdStat);
+        //     self.lcdstate = LCDState::Mode0;
+        // }
+    }
 
-        if screen_y == 143 {
-            self.request_interrupt(Interrupt::VBlank);
-        }
-
+    fn draw(&mut self, rl: &mut RaylibHandle, thread: &RaylibThread) {
         let mut d = rl.begin_drawing(&thread);
+        let screen_y = *self.get_lc_reg_mut() as u16;
 
         for screen_x in 0..160_u16 {
             let (scx, scy) = (*self.get_scx_mut(), *self.get_scy_mut());
@@ -1455,27 +1594,74 @@ impl GameBoy {
             }
         }
 
+        if self.get_lcd_control_register(LCDControlRegister::ObjEnable) {
+            return;
+        }
+
         for object_idx in 0..40 {
             let (y_pos, x_pos, tile_idx, flags) = (
-                self.oam[object_idx + 0],
-                self.oam[object_idx + 1],
+                self.oam[object_idx + 0] as i32 - 16,
+                self.oam[object_idx + 1] as i32 - 8,
                 self.oam[object_idx + 2],
                 self.oam[object_idx + 3],
             );
 
-            if let y_start = y_pos < 0 {
-                y_pos
-            } else {
-                y_pos
+            if (flags >> 7) & 1 == 1 {
+                return;
+            }
+
+            let obj_size = match self.get_lcd_control_register(LCDControlRegister::ObjSize) {
+                true => 16,
+                false => 8,
             };
 
-            if let x_start = x_pos < 0 {
-                x_pos
-            } else {
-                x_pos
-            };
+            for y in 0..obj_size {
+                let byte1 = self.read_vram(0x8000 + (tile_idx as u16 * obj_size) + y * 2);
+                let byte2 = self.read_vram(0x8000 + (tile_idx as u16 * obj_size) + (y * 2) + 1);
 
-            let tile_data_addr = self.read_vram(0x8000 + tile_idx as u16 * 16);
+                for x in 0..8 {
+                    if x as i32 + x_pos < 0 {
+                        continue;
+                    }
+                    if y as i32 + y_pos < 0 {
+                        continue;
+                    }
+
+                    let color_value = ((byte2 >> (7 - x)) & 1) << 1 | (byte1 >> (7 - x)) & 1;
+
+                    match color_value {
+                        0 => d.draw_rectangle(
+                            x_pos + x as i32 * 2,
+                            y_pos + y as i32 * 2,
+                            2,
+                            2,
+                            Color::WHITE,
+                        ),
+                        1 => d.draw_rectangle(
+                            x_pos + x as i32 * 2,
+                            y_pos + y as i32 * 2,
+                            2,
+                            2,
+                            Color::LIGHTGRAY,
+                        ),
+                        2 => d.draw_rectangle(
+                            x_pos + x as i32 * 2,
+                            y_pos + y as i32 * 2,
+                            2,
+                            2,
+                            Color::GRAY,
+                        ),
+                        3 => d.draw_rectangle(
+                            x_pos + x as i32 * 2,
+                            y_pos + y as i32 * 2,
+                            2,
+                            2,
+                            Color::BLACK,
+                        ),
+                        _ => unreachable!("{color_value}"),
+                    }
+                }
+            }
         }
     }
 }
