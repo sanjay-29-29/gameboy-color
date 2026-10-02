@@ -1,10 +1,11 @@
 use std::{
-    option::Iter,
     thread,
     time::{Duration, Instant},
 };
 
-use raylib::{RaylibHandle, RaylibThread, drawing::RaylibDraw, ffi::KeyboardKey};
+use raylib::{
+    RaylibHandle, RaylibThread, audio::RaylibAudio, drawing::RaylibDraw, ffi::KeyboardKey,
+};
 
 use crate::constants::*;
 
@@ -20,7 +21,6 @@ enum Interrupt {
     VBlank,
     LcdStat,
     Timer,
-    Serial,
     Joypad,
 }
 
@@ -41,6 +41,7 @@ pub struct GameBoy {
     v_ram: [u8; 16 * 1024],  // Video RAM
     h_ram: [u8; 128],        // High RAM
     oam: [u8; 160],          // Object Attribute Memory
+    cram: [u8; 128],         // CRAM
     io_registers: [u8; 128], // IO Registers
 
     // GP registers
@@ -101,6 +102,7 @@ impl GameBoy {
             h_ram: [0; 128],
             oam: [0; 160],
             io_registers: [0; 128],
+            cram: [0; 128],
 
             catrigde_rom: [0; 1024 * 1024],
             catridge_ram: [0; 1024 * 1024],
@@ -108,7 +110,7 @@ impl GameBoy {
             external_ram_enabled: false,
             catridge_selected_rom: 1,
             catridge_selected_ram: 0,
-            boot_rom_disabled: false,
+            boot_rom_disabled: true,
 
             interrupt_master_enable: false, // disabled when game starts running
             interrupt_enable: 0,
@@ -276,6 +278,28 @@ impl GameBoy {
                     BANK_REGISTER => {
                         self.boot_rom_disabled = true;
                     }
+                    BGPD => {
+                        let bgpi = self.io_registers[BGPI - 0xFF00];
+                        let mut addr = bgpi as usize & 0b11111;
+                        self.cram[addr] = val;
+
+                        if bgpi >> 7 == 1 {
+                            addr = (addr + 1) % 63;
+                        }
+
+                        self.io_registers[BGPI - 0xFF00] &= addr as u8;
+                    }
+                    OGPD => {
+                        let ogpd = self.io_registers[OGPD - 0xFF00];
+                        let mut addr = ogpd as usize & 0b11111;
+                        self.cram[64 + addr] = val;
+
+                        if ogpd >> 7 == 1 {
+                            addr = (addr + 1) % 63;
+                        }
+
+                        self.io_registers[OGPI - 0xFF00] &= addr as u8;
+                    }
                     _ => self.io_registers[addr_usize - 0xff00] = val,
                 }
             }
@@ -303,6 +327,9 @@ impl GameBoy {
                 }
             }
             0x0100..=0x3fff => {
+                if addr >= 0x0200 && addr <= 0x08FF && !self.boot_rom_disabled {
+                    return self.boot_rom[addr_usize - 0xFF];
+                }
                 // 16 KiB ROM bank 00
                 return self.catrigde_rom[addr_usize];
             }
@@ -374,6 +401,14 @@ impl GameBoy {
                         }
                     }
                 }
+                if addr_usize == BGPD {
+                    let addr = self.io_registers[BGPI - 0xFF00] as usize & 0x1F;
+                    return self.cram[addr];
+                }
+                if addr_usize == OGPD {
+                    let addr = self.io_registers[OGPI - 0xFF00] as usize & 0x1F;
+                    return self.cram[64 + addr];
+                }
                 return self.io_registers[addr_usize - 0xff00];
             }
             0xff80..=0xfffe => {
@@ -388,6 +423,7 @@ impl GameBoy {
 
     pub fn main(&mut self) {
         let (mut rl, thread) = raylib::init().size(320, 288).title("Gameboy").build();
+        // let audio = RaylibAudio::init_audio_device().expect("audio init failed");
 
         let cpu_time = Duration::from_secs_f64(1.0 / 4096.0);
 
@@ -455,6 +491,12 @@ impl GameBoy {
         if rl.is_key_down(KeyboardKey::KEY_K) {
             self.joypad = self.joypad | 1 << 4;
         }
+
+        if self.io_registers[JOYPAD - 0xff00] >> 4 & 1 == 1
+            || self.io_registers[JOYPAD - 0xff00] >> 5 & 1 == 1
+        {
+            self.request_interrupt(Interrupt::Joypad);
+        }
     }
 
     pub fn handle_interrupt(&mut self) -> bool {
@@ -484,7 +526,6 @@ impl GameBoy {
                 0 => 0x0040, // VBlank
                 1 => 0x0048, // LCD STAT
                 2 => 0x0050, // Timer
-                3 => 0x0058, // Serial
                 4 => 0x0060, // Joypad
                 _ => panic!("Invalid Interrupt {i}"),
             };
@@ -498,6 +539,10 @@ impl GameBoy {
     }
 
     fn update_timers(&mut self) {
+        if self.double_speed_mode {
+            self.instruction_m_cycle /= 2;
+        }
+
         let t_cycles = self.instruction_m_cycle * 4;
 
         self.m_cycles = self.m_cycles.wrapping_add(self.instruction_m_cycle as u64);
@@ -549,8 +594,8 @@ impl GameBoy {
         let opcode = self.fetch_value_u8();
         let (x, y, z) = (opcode >> 6, (opcode >> 3) & 0x07, opcode & 0x07);
 
-        // println!("{:x} {:x}", opcode, self.pc);
-        // thread::sleep(Duration::from_millis(1));
+        println!("{:x} {:x}", opcode, self.pc);
+        thread::sleep(Duration::from_millis(100));
 
         match x {
             0 => {
@@ -560,7 +605,17 @@ impl GameBoy {
                     }
                     if y == 2 {
                         // TODO: stop
-                        // println!("Stop executed.");
+                        let spd = *self.get_speed_reg_mut();
+                        println!("{spd:b}");
+
+                        if spd & 1 == 1 {
+                            let current_speed = spd >> 7 & 1 == 1;
+                            if current_speed {
+                                self.double_speed_mode = false;
+                            } else {
+                                self.double_speed_mode = true;
+                            }
+                        }
                     }
                     if y == 3 {
                         // jr imm8
@@ -1424,7 +1479,6 @@ impl GameBoy {
             Interrupt::VBlank => 0,
             Interrupt::LcdStat => 1,
             Interrupt::Timer => 2,
-            Interrupt::Serial => 3,
             Interrupt::Joypad => 4,
         };
 
@@ -1545,7 +1599,7 @@ impl GameBoy {
                     self.ppu_timer -= 204;
 
                     let sy = self.get_ly_reg_mut();
-                    *sy = (*sy + 1) % 154;
+                    *sy = (*sy).wrapping_add(1) % 154;
                     lc_changed = true;
 
                     if *sy == 144 {
@@ -1650,19 +1704,25 @@ impl GameBoy {
     fn update_framebuffer(&mut self) {
         let screen_y = *self.get_ly_reg_mut() as u16;
 
+        if screen_y >= 144 {
+            return;
+        }
+
+        let tile_map_base_addr = match self.get_lcd_control_register(LCDControlRegister::BGTileMap)
+        {
+            false => 0x9800,
+            true => 0x9C00,
+        };
+
         for screen_x in 0..160_u16 {
             let (scx, scy) = (*self.get_scx_mut(), *self.get_scy_mut());
-
-            let tile_map_base_addr =
-                match self.get_lcd_control_register(LCDControlRegister::BGTileMap) {
-                    false => 0x9800,
-                    true => 0x9C00,
-                };
 
             let a = (scx as u16 + screen_x) % 256;
             let b = (scy as u16 + screen_y) % 256;
 
             let tile_map = self.read_vram(tile_map_base_addr + (b / 8) * 32 + (a / 8));
+
+            let (tile_row, tile_col) = ((scy as u16 + screen_y) % 8, (scx as u16 + screen_x) % 8);
 
             let tile_data_addr: usize =
                 match self.get_lcd_control_register(LCDControlRegister::BGWindowTileArea) {
@@ -1670,13 +1730,12 @@ impl GameBoy {
                     false => (0x9000 + (tile_map as i8 as i32 * 16)) as usize,
                 };
 
-            let (tile_row, tile_col) = ((scy as u16 + screen_y) % 8, (scx as u16 + screen_x) % 8);
-
             let byte1 = self.read_vram(tile_data_addr as u16 + tile_row * 2);
             let byte2 = self.read_vram(tile_data_addr as u16 + (tile_row * 2) + 1);
 
             let color_value = ((byte2 >> (7 - tile_col)) & 1) << 1 | (byte1 >> (7 - tile_col)) & 1;
 
+            // println!("{screen_x} {screen_y}");
             self.frame_buffer[screen_x as usize * 144 + screen_y as usize] = color_value;
         }
 
@@ -1684,38 +1743,44 @@ impl GameBoy {
             self.update_objects();
         }
 
-        // if self.get_lcd_control_register(LCDControlRegister::WindowEnable) {
-        //     let (wy, wx) = (self.get_wy() as i16 - 7, self.get_wx() as i16);
+        if self.get_lcd_control_register(LCDControlRegister::WindowEnable) {
+            let (wy, wx) = (self.get_wy() as u16, self.get_wx() as i16 - 7);
 
-        //     let tile_map_base_addr =
-        //         match self.get_lcd_control_register(LCDControlRegister::BGTileMap) {
-        //             false => 0x9800,
-        //             true => 0x9C00,
-        //         };
+            let window_tile_map_base_addr =
+                match self.get_lcd_control_register(LCDControlRegister::WindowTileMap) {
+                    true => 0x9800,
+                    false => 0x9c00,
+                };
 
-        //     for screen_x in 0..160 {
-        //         let a = (wx as u16 + screen_x) % 256;
-        //         let b = (wy as u16 + screen_y) % 256;
+            // println!("{wy} {wx}");
 
-        //         let tile_map = self.read_vram(tile_map_base_addr + (b / 8) * 32 + (a / 8));
+            for screen_y in wy..144 {
+                for screen_x in wx..160 {
+                    if screen_x < 0 || screen_x >= 144 || screen_y >= 160 {
+                        continue;
+                    }
 
-        //         let tile_data_addr: usize =
-        //             match self.get_lcd_control_register(LCDControlRegister::BGWindowTileArea) {
-        //                 true => 0x8000 + (tile_map as usize * 16),
-        //                 false => (0x9000 + (tile_map as i8 as i32 * 16)) as usize,
-        //             };
+                    let tile_map = self.read_vram(
+                        window_tile_map_base_addr + (screen_y / 8) * 32 + (screen_x as u16 / 8),
+                    );
 
-        //         let (tile_row, tile_col) = ((wy as u16 + screen_y) % 8, (wx as u16 + screen_x) % 8);
+                    let (tile_row, tile_col) = ((screen_y) % 8, (screen_x) % 8);
+                    let tile_data_addr: usize =
+                        match self.get_lcd_control_register(LCDControlRegister::BGWindowTileArea) {
+                            true => 0x8000 + (tile_map as usize * 16),
+                            false => (0x9000 + (tile_map as i8 as i32 * 16)) as usize,
+                        };
 
-        //         let byte1 = self.read_vram(tile_data_addr as u16 + tile_row * 2);
-        //         let byte2 = self.read_vram(tile_data_addr as u16 + (tile_row * 2) + 1);
+                    let byte1 = self.read_vram(tile_data_addr as u16 + tile_row * 2);
+                    let byte2 = self.read_vram(tile_data_addr as u16 + (tile_row * 2) + 1);
 
-        //         let color_value =
-        //             ((byte2 >> (7 - tile_col)) & 1) << 1 | (byte1 >> (7 - tile_col)) & 1;
+                    let color_value =
+                        ((byte2 >> (7 - tile_col)) & 1) << 1 | (byte1 >> (7 - tile_col)) & 1;
 
-        //         self.frame_buffer[screen_x as usize * 144 + screen_y as usize] = color_value;
-        //     }
-        // }
+                    self.frame_buffer[screen_x as usize * 144 + screen_y as usize] = color_value;
+                }
+            }
+        }
     }
 
     fn draw(&mut self, rl: &mut RaylibHandle, thread: &RaylibThread) {

@@ -19,3 +19,7 @@ pub const SCX: usize = 0xFF43; // Scroll X
 pub const SPD: usize = 0xFF4D; // Prepare speed switch
 pub const DMA: usize = 0xFF46; // OAM DMA source address & start
 pub const JOYPAD: usize = 0xFF00; // Joypad
+pub const BGPI: usize = 0xFF68; // Background palette index
+pub const BGPD: usize = 0xFF69; // Background palette data
+pub const OGPI: usize = 0xFF6A; // OBJ palette index
+pub const OGPD: usize = 0xFF6B; // OBJ palette data
